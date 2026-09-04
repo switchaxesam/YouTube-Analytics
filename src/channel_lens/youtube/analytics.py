@@ -46,13 +46,18 @@ log = logging.getLogger(__name__)
 ANALYTICS_ROOT = "https://youtubeanalytics.googleapis.com/v2"
 REPORTING_ROOT = "https://youtubereporting.googleapis.com/v1"
 
-#: Read-only analytics. Deliberately excludes the monetary scope — this app has
-#: no use for revenue data, and asking for a permission you don't need is a bad
-#: trade for the user.
-SCOPES = [
-    "https://www.googleapis.com/auth/yt-analytics.readonly",
-    "https://www.googleapis.com/auth/youtube.readonly",
-]
+#: The single scope this app needs.
+#:
+#: It covers both hosts we authenticate against — the Analytics API v2 and the
+#: Reporting API — because every OAuth call in this module targets one of those
+#: two. Nothing here touches the Data API over OAuth; that runs on the API key.
+#:
+#: Deliberately excludes two scopes it would be easy to add by reflex.
+#: ``yt-analytics-monetary.readonly`` would hand over revenue data this app has
+#: no use for. ``youtube.readonly`` was requested in an earlier version and
+#: never actually used — an unused permission is pure downside, and dropping it
+#: also removes a second "sensitive" scope from the consent screen.
+SCOPES = ["https://www.googleapis.com/auth/yt-analytics.readonly"]
 
 #: The Reporting API report type carrying thumbnail impressions and CTR.
 REACH_REPORT_TYPE = "channel_reach_basic_a1"
