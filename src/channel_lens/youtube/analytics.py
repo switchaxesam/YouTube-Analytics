@@ -32,6 +32,7 @@ import csv
 import io
 import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
@@ -159,10 +160,64 @@ def build_auth_url(
         scopes=SCOPES,
         redirect_uri=redirect_uri,
     )
-    url, state = flow.authorization_url(
-        access_type="offline", prompt="consent", include_granted_scopes="true"
-    )
+    # Deliberately NOT passing include_granted_scopes. That turns on incremental
+    # authorisation, which makes Google return every scope the account has ever
+    # granted this client — not just the one asked for here. oauthlib then sees
+    # the returned scope set differ from the requested one and refuses the
+    # exchange with "Scope has changed". This app wants exactly one scope, so
+    # incremental auth buys nothing and costs a confusing failure.
+    url, state = flow.authorization_url(access_type="offline", prompt="consent")
     return url, state
+
+
+def _explain_exchange_failure(exc: Exception) -> AnalyticsError:
+    """Turn an oauthlib/Google token-exchange failure into a specific diagnosis.
+
+    Each of these needs a different fix and they are indistinguishable from the
+    single generic message this used to report. The raw text is always appended,
+    because a confident wrong guess that hides the real error is worse than no
+    guess at all.
+    """
+    text = str(exc)
+    lowered = text.lower()
+
+    if "scope has changed" in lowered:
+        return AnalyticsError(
+            "Google granted a different set of permissions than were requested.",
+            f"Usually harmless and now tolerated automatically — try connecting again. "
+            f"If it repeats, revoke access at myaccount.google.com/permissions "
+            f"and retry. ({text})",
+        )
+    if "redirect_uri_mismatch" in lowered:
+        return AnalyticsError(
+            "The redirect address didn't match what Google expected.",
+            f"Confirm the OAuth client's application type is 'Desktop app'. A "
+            f"'Web application' client requires the exact redirect URI to be "
+            f"registered up front. ({text})",
+        )
+    if "invalid_grant" in lowered:
+        return AnalyticsError(
+            "Google rejected the authorisation code as already used or expired.",
+            f"Codes are single-use and short-lived. Press Connect again and complete "
+            f"the consent screen without reloading it. ({text})",
+        )
+    if "invalid_client" in lowered or "unauthorized_client" in lowered:
+        return AnalyticsError(
+            "Google rejected the client ID or secret.",
+            f"Re-copy both from the Cloud console into Settings. The secret is shown "
+            f"only once at creation, so a rotated client needs its new secret. ({text})",
+        )
+    if "access_denied" in lowered:
+        return AnalyticsError(
+            "Access was declined on the Google consent screen.",
+            "Press Connect again and choose Allow. If an 'unverified app' warning "
+            "appears, use Advanced → Go to Channel Lens first.",
+        )
+    return AnalyticsError(
+        f"The token exchange with Google failed: {text}",
+        "If that isn't obviously a credential problem, the full traceback is in the "
+        "terminal running Channel Lens.",
+    )
 
 
 def exchange_code(
@@ -176,13 +231,18 @@ def exchange_code(
         scopes=SCOPES,
         redirect_uri=redirect_uri,
     )
+    # Google routinely returns the granted scopes in a different order from the
+    # request, and may fold in `openid`. oauthlib treats any difference as
+    # tampering and aborts. Relaxing this is safe here because authorisation is
+    # carried by the token itself, not by our expectations about it — and the
+    # scopes actually granted are recorded below.
+    os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+
     try:
         flow.fetch_token(code=code)
     except Exception as exc:  # noqa: BLE001 - oauthlib raises a wide variety
-        raise AnalyticsError(
-            "Google rejected the authorisation code.",
-            "This usually means the code was already used or expired. Try connecting again.",
-        ) from exc
+        log.exception("OAuth token exchange failed")
+        raise _explain_exchange_failure(exc) from exc
 
     credentials = flow.credentials
     payload = {

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from html import escape
 from typing import Any
 
 import httpx
@@ -226,7 +227,7 @@ def auth_callback(
     opened in a real browser tab that the user should not be left staring at.
     """
     if error:
-        body = f"<h1>Authorisation cancelled</h1><p>Google said: {error}</p>"
+        body = f"<h1>Authorisation cancelled</h1><p>Google said: {escape(error)}</p>"
         return HTMLResponse(_callback_page(body, ok=False), status_code=400)
     if not code:
         return HTMLResponse(
@@ -240,10 +241,13 @@ def auth_callback(
             config.google_client_id, config.google_client_secret, _redirect_uri(), code
         )
     except YouTubeError as exc:
-        return HTMLResponse(
-            _callback_page(f"<h1>Connection failed</h1><p>{exc.message}</p>", ok=False),
-            status_code=400,
+        # The hint carries the actual diagnosis, so it has to reach the page.
+        # Both halves are escaped: they can embed raw text from Google.
+        body = (
+            f"<h1>Connection failed</h1><p>{escape(exc.message)}</p>"
+            f"<p class='hint'>{escape(exc.hint)}</p>"
         )
+        return HTMLResponse(_callback_page(body, ok=False), status_code=400)
 
     return HTMLResponse(
         _callback_page(
@@ -266,6 +270,7 @@ def _callback_page(body: str, *, ok: bool) -> str:
            border: 1px solid #232830; border-radius: 14px; background: #12151a; }}
   h1 {{ font-size: 1.35rem; margin: 0 0 .5rem; color: {accent}; }}
   p {{ margin: 0; color: #9aa3ad; }}
+  p.hint {{ margin-top: .75rem; font-size: .875rem; color: #6b7480; line-height: 1.5; }}
 </style></head>
 <body><div class="card">{body}</div>
 <script>setTimeout(() => window.close(), 2500);</script>
