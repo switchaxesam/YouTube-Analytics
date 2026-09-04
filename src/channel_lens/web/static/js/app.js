@@ -78,6 +78,19 @@ function renderSetupBadge(missing) {
   badge.textContent = String(count);
 }
 
+/** Nudge toward the tracker when competitors have changed something recently. */
+export async function refreshChangesBadge() {
+  const badge = document.getElementById('nav-badge-changes');
+  try {
+    const changes = await api.get('/api/changes', { days: 7, limit: 50 });
+    badge.hidden = changes.length === 0;
+    badge.textContent = String(changes.length);
+    badge.title = `${changes.length} packaging change${changes.length === 1 ? '' : 's'} in the last 7 days`;
+  } catch {
+    badge.hidden = true;
+  }
+}
+
 /* --------------------------------------------------------------- router */
 
 let currentRoute = null;
@@ -144,6 +157,7 @@ window.addEventListener('hashchange', navigate);
 (async function start() {
   await refreshStatus();
   await refreshChannels();
+  await refreshChangesBadge();
   await navigate();
 
   // Keep the quota meter honest without polling hard — it only moves when the

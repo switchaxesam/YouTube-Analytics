@@ -109,6 +109,13 @@
 
 *, *::before, *::after { box-sizing: border-box; }
 
+/* The browser's own `[hidden] { display: none }` is a bare attribute selector,
+ * so ANY class rule that sets `display` silently defeats it. That bug shipped
+ * here once — a full-screen modal scrim stayed over the page eating every
+ * click, and both sidebar badges rendered as permanent dots. This is the
+ * blanket fix: `el.hidden = true` now always hides, whatever the class says. */
+[hidden] { display: none !important; }
+
 html, body { height: 100%; }
 
 body {
