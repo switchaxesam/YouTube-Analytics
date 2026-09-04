@@ -181,7 +181,18 @@ def jobs(
 
 
 def _redirect_uri() -> str:
-    return f"http://localhost:{get_settings().port}/api/auth/callback"
+    """Loopback redirect for the OAuth handshake.
+
+    ``127.0.0.1`` rather than ``localhost`` on Google's own recommendation —
+    ``localhost`` resolution can be intercepted by client firewalls, and it may
+    resolve to IPv6 ``::1`` while the server is listening on IPv4. The literal
+    address has neither failure mode.
+
+    Desktop-app OAuth clients accept any loopback port without registering it,
+    which is what lets the app fall back to a different port when 8730 is taken
+    and still authenticate.
+    """
+    return f"http://127.0.0.1:{get_settings().port}/api/auth/callback"
 
 
 @router.get("/auth/url")
