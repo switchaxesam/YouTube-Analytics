@@ -101,10 +101,18 @@ Then open Settings. Only the first credential is required:
 1. **YouTube Data API key** — free. Google Cloud → new project → enable
    *YouTube Data API v3* → Credentials → API key.
 2. **Your channel** — paste a handle, ID, or URL.
-3. **Google OAuth client** (for your own CTR) — same project, enable *YouTube
-   Analytics API* and *YouTube Reporting API*, then Credentials → OAuth client
-   ID → application type **Desktop app**. That type permits the localhost
-   redirect this app uses.
+3. **Google OAuth client** (for your own CTR) — same project:
+   - Enable *YouTube Analytics API* **and** *YouTube Reporting API*. Both are
+     needed; CTR comes only from the Reporting one.
+   - Configure the OAuth consent screen, user type **External**.
+   - Set publishing status to **In production**. In *Testing* mode Google
+     expires refresh tokens after 7 days, so the connection would silently die
+     every week. Publishing needs no Google verification — you'll see an
+     "unverified app" warning once and choose Advanced → Go to Channel Lens.
+   - Credentials → OAuth client ID → application type **Desktop app**. That
+     type permits the localhost redirect this app uses.
+   - Scope requested: `yt-analytics.readonly`, and nothing else. It covers both
+     the Analytics and Reporting APIs. Revenue scopes are never requested.
 4. **Anthropic API key** (optional) — only for AI thumbnail breakdowns.
 
 The Settings screen carries these steps inline, with a "Test key" button for

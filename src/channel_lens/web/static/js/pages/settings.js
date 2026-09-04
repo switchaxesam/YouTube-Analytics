@@ -190,11 +190,21 @@ function credentialsCard(settings) {
         el('ol', { class: 'steps' },
           el('li', {}, 'In the same project, open APIs & Services → Library and enable ',
             el('strong', { text: 'YouTube Analytics API' }), ' and ',
-            el('strong', { text: 'YouTube Reporting API' }), '.'),
-          el('li', {}, 'Go to Credentials → Create credentials → OAuth client ID.'),
-          el('li', {}, 'Choose application type ', el('strong', { text: 'Desktop app' }),
+            el('strong', { text: 'YouTube Reporting API' }),
+            '. Both are needed — CTR comes only from the Reporting one.'),
+          el('li', {}, 'Configure the OAuth consent screen. User type ',
+            el('strong', { text: 'External' }), ' (Internal needs a Workspace organisation).'),
+          el('li', {}, 'Set publishing status to ', el('strong', { text: 'In production' }),
+            '. This matters: in Testing mode Google expires the connection after ' +
+            '7 days and you would have to reconnect weekly.'),
+          el('li', {}, 'Go to Credentials → Create credentials → OAuth client ID, ' +
+            'application type ', el('strong', { text: 'Desktop app' }),
             ' — that type permits the localhost redirect this app uses.'),
           el('li', {}, 'Paste the client ID and secret below, save, then press Connect.')),
+        notice('info', 'Expect an “unverified app” warning',
+          'Google shows it for any app it has not reviewed, which includes every ' +
+          'personal tool. Choose Advanced → Go to Channel Lens. Verification only ' +
+          'exists to remove that screen for strangers; you are the only user.'),
         el('div', { class: 'grid cols-2' },
           field('Client ID', clientId),
           field('Client secret', clientSecret)),

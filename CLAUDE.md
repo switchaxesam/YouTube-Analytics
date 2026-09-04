@@ -88,9 +88,19 @@ This cost real research time and is easy to get wrong from memory:
   `date` / `channel_id` / `video_id`. Register a job, Google generates dailies;
   **first report up to 48 hours later**, 30 days backfilled, 60-day retention.
 
-Both use `yt-analytics.readonly`. Neither spends Data API quota. The 48-hour
-wait is Google's, and the UI states it plainly — without that, the screen looks
-broken for two days.
+Both are covered by the single scope `yt-analytics.readonly`; nothing here
+authenticates against the Data API, so `youtube.readonly` is deliberately not
+requested (it was in the first version, and was never used). Neither API spends
+Data API quota. The 48-hour wait is Google's, and the UI states it plainly —
+without that, the screen looks broken for two days.
+
+**Consent-screen trap, confirmed 2026-09-03.** An OAuth consent screen left in
+*Testing* publishing status expires refresh tokens after **7 days**, so the
+connection dies weekly with no useful error. Publishing status must be *In
+production*, which needs no Google verification — an unverified app just shows a
+warning screen and caps at 100 users. User type must be *External*, since the
+account is personal Gmail rather than Workspace. This is spelled out in the
+in-app setup steps and the README because it is invisible until it breaks.
 
 ## Conventions
 
