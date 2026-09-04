@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Channel Lens</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/css/app.css">
+<link rel="stylesheet" href="/static/css/charts.css">
+<link rel="stylesheet" href="/static/css/components.css">
+</head>
+<body>
+
+<div class="app" id="app">
+
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/>
+        <path d="M15.5 15.5 L21 21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        <path d="M8.5 8 v5 l4-2.5z" fill="currentColor"/>
+      </svg>
+      <span class="brand-name">Channel Lens</span>
+    </div>
+
+    <nav class="nav" id="nav">
+      <a class="nav-item" href="#/overview"   data-route="overview">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="2.5" width="6" height="6" rx="1.5"/><rect x="11.5" y="2.5" width="6" height="6" rx="1.5"/><rect x="2.5" y="11.5" width="6" height="6" rx="1.5"/><rect x="11.5" y="11.5" width="6" height="6" rx="1.5"/></svg>
+        <span>Overview</span>
+      </a>
+      <a class="nav-item" href="#/outliers"   data-route="outliers">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.5 15 L7 9.5 L11 12.5 L17.5 4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><circle cx="17.5" cy="4" r="2.2"/></svg>
+        <span>Outliers</span>
+      </a>
+      <a class="nav-item" href="#/discover"   data-route="discover">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="5.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M13 13 L17.5 17.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        <span>Discover</span>
+      </a>
+      <a class="nav-item" href="#/channels"   data-route="channels">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="6" r="3"/><path d="M4 17c0-3.3 2.7-5.5 6-5.5s6 2.2 6 5.5z"/></svg>
+        <span>Channels</span>
+      </a>
+      <a class="nav-item" href="#/tracker"    data-route="tracker">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M10 5.5V10l3 2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        <span>Tracker</span>
+        <span class="nav-badge" id="nav-badge-changes" hidden></span>
+      </a>
+      <a class="nav-item" href="#/packaging"  data-route="packaging">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="4" width="15" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="7" cy="8.5" r="1.6"/><path d="M3.5 14l4-3.5 3 2.5 3-3 3.2 3.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>Packaging</span>
+      </a>
+      <a class="nav-item" href="#/my-channel" data-route="my-channel">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5l2.2 4.7 5.3.7-3.9 3.6 1 5.1L10 14.2 5.4 16.6l1-5.1L2.5 7.9l5.3-.7z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+        <span>My Channel</span>
+      </a>
+    </nav>
+
+    <div class="sidebar-foot">
+      <a class="nav-item" href="#/settings" data-route="settings">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="2.6" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M10 1.8v2.4M10 15.8v2.4M18.2 10h-2.4M4.2 10H1.8M15.8 4.2l-1.7 1.7M5.9 14.1l-1.7 1.7M15.8 15.8l-1.7-1.7M5.9 5.9L4.2 4.2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+        <span>Settings</span>
+        <span class="nav-badge warn" id="nav-badge-setup" hidden></span>
+      </a>
+
+      <div class="quota" id="quota" title="YouTube Data API quota used today">
+        <div class="quota-head">
+          <span class="quota-label">API quota</span>
+          <span class="quota-value" id="quota-value">—</span>
+        </div>
+        <div class="meter"><div class="meter-fill" id="quota-fill" style="width:0%"></div></div>
+        <div class="quota-reset" id="quota-reset"></div>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main" id="main">
+    <div class="view" id="view" aria-live="polite"></div>
+  </main>
+
+</div>
+
+<div class="toasts" id="toasts" aria-live="assertive"></div>
+<div class="modal-root" id="modal-root" hidden></div>
+
+<script type="module" src="/static/js/app.js"></script>
+</body>
+</html>
