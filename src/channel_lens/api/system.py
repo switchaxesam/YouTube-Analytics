@@ -219,7 +219,7 @@ def auth_url() -> dict[str, Any]:
 
 @router.get("/auth/callback", response_class=HTMLResponse)
 def auth_callback(
-    code: str | None = None, error: str | None = None
+    code: str | None = None, state: str | None = None, error: str | None = None
 ) -> HTMLResponse:
     """Google redirects here after consent.
 
@@ -237,8 +237,11 @@ def auth_callback(
 
     config = get_settings()
     try:
+        # `state` is echoed back by Google and is what pairs this callback with
+        # the PKCE verifier stored when the authorisation URL was built.
         analytics.exchange_code(
-            config.google_client_id, config.google_client_secret, _redirect_uri(), code
+            config.google_client_id, config.google_client_secret, _redirect_uri(),
+            code, state=state,
         )
     except YouTubeError as exc:
         # The hint carries the actual diagnosis, so it has to reach the page.

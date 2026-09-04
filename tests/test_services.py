@@ -289,3 +289,56 @@ def test_quota_day_follows_pacific_not_local():
     """Google's reset is midnight US/Pacific; using UTC would be a day out."""
     assert quota_day(datetime(2026, 3, 2, 6, 0, tzinfo=timezone.utc)).day == 1
     assert quota_day(datetime(2026, 3, 2, 9, 0, tzinfo=timezone.utc)).day == 2
+
+
+# -------------------------------------------------------------------- PKCE
+
+
+def test_pkce_verifier_survives_between_the_two_flow_objects():
+    """The auth URL and the token exchange are built by separate Flow objects.
+
+    The library generates a PKCE verifier when the URL is built and needs the
+    same value at the exchange. Losing it fails with Google's opaque
+    "(invalid_grant) Missing code verifier", which is what shipped first.
+    """
+    from channel_lens.youtube import analytics
+
+    url, state = analytics.build_auth_url(
+        "cid.apps.googleusercontent.com", "GOCSPX-secret",
+        "http://127.0.0.1:8730/api/auth/callback",
+    )
+
+    assert "code_challenge=" in url
+    assert "code_challenge_method=S256" in url
+
+    verifier = analytics._take_verifier(state)
+    assert verifier and len(verifier) >= 43  # RFC 7636 minimum
+
+
+def test_pkce_verifier_is_single_use():
+    from channel_lens.youtube import analytics
+
+    _url, state = analytics.build_auth_url(
+        "cid", "secret", "http://127.0.0.1:8730/api/auth/callback")
+
+    assert analytics._take_verifier(state) is not None
+    assert analytics._take_verifier(state) is None
+
+
+def test_pkce_verifier_requires_a_matching_state():
+    """A callback from a different attempt must not collect this verifier."""
+    from channel_lens.youtube import analytics
+
+    analytics.build_auth_url(
+        "cid", "secret", "http://127.0.0.1:8730/api/auth/callback")
+    assert analytics._take_verifier("some-other-state") is None
+
+
+def test_lost_verifier_is_explained_not_blamed_on_the_code():
+    """The raw error says invalid_grant, which sends you down the wrong path."""
+    from channel_lens.youtube.analytics import _explain_exchange_failure
+
+    err = _explain_exchange_failure(Exception("(invalid_grant) Missing code verifier."))
+    assert "security check" in err.message.lower()
+    assert "Connect again" in err.hint
+    assert "Missing code verifier" in err.hint  # raw text always preserved
