@@ -220,3 +220,153 @@ def test_title_comparison_without_an_own_channel(client):
     body = client.get("/api/titles/compare").json()
     assert body["has_own_channel"] is False
     assert body["comparisons"] == []
+
+
+# --------------------------------------------------------------- bulk import
+
+
+def _stub_youtube(monkeypatch, *, explode_on: str = ""):
+    """Stand in for the Data API so bulk import can be exercised offline.
+
+    ``explode_on`` makes one channel raise during the database flush, which is
+    the failure that used to poison the session and kill the rest of the batch.
+    """
+    from channel_lens.youtube import client as yt
+    from channel_lens.youtube.errors import NotFound
+
+    def resolve(self, reference):
+        if "missing" in reference:
+            raise NotFound("No channel matches that reference.", "Check the handle.")
+        slug = reference.strip("@/").split("/")[-1][:18] or "x"
+        return {
+            "id": ("UC" + slug).ljust(24, "0")[:24],
+            "snippet": {"title": f"Channel {slug}", "customUrl": f"@{slug}",
+                        "thumbnails": {"high": {"url": "https://x/t.jpg"}}},
+            "statistics": {"subscriberCount": "1000", "videoCount": "10",
+                           "viewCount": "50000"},
+            "contentDetails": {"relatedPlaylists": {"uploads": "UU" + slug}},
+        }
+
+    def uploads(self, playlist_id, *, limit=50, published_after=None):
+        self.ledger.record(self.session, "playlistItems.list")
+        return [f"{playlist_id}-v{i}" for i in range(2)]
+
+    def videos(self, video_ids):
+        self.ledger.record(self.session, "videos.list")
+        out = []
+        for vid in video_ids:
+            slug = vid.split("-v")[0][2:]
+            # A channel_id with no matching row violates the foreign key at flush.
+            channel_id = "UC_nonexistent" if (explode_on and slug == explode_on) \
+                else ("UC" + slug).ljust(24, "0")[:24]
+            out.append({
+                "id": vid[:32],
+                "snippet": {"title": f"Video {vid}", "channelId": channel_id,
+                            "publishedAt": "2026-01-01T00:00:00Z",
+                            "thumbnails": {"high": {"url": "https://x/v.jpg"}},
+                            "tags": []},
+                "statistics": {"viewCount": "1000", "likeCount": "10",
+                               "commentCount": "1"},
+                "contentDetails": {"duration": "PT10M"},
+            })
+        return out
+
+    monkeypatch.setattr(yt.YouTubeClient, "resolve_channel", resolve)
+    monkeypatch.setattr(yt.YouTubeClient, "list_upload_video_ids", uploads)
+    monkeypatch.setattr(yt.YouTubeClient, "get_videos", videos)
+
+
+def test_bulk_preview_spends_no_quota(client):
+    """Pricing an import must never itself cost anything."""
+    client.put("/api/settings", json={"youtube_api_key": "AIzaTEST"})
+
+    body = client.post("/api/channels/bulk/preview", json={
+        "text": "@one\n- @two\n3. @three\n@one", "video_limit": 50,
+    }).json()
+
+    assert body["parsed"] == 3          # duplicate dropped
+    assert body["to_import"] == 3
+    assert body["estimated_units"] == 3 * body["per_channel_units"]
+    assert client.get("/api/quota").json()["used"] == 0
+
+
+def test_bulk_import_isolates_a_failing_channel(client, monkeypatch):
+    """The whole point: one bad row must not take the batch down with it.
+
+    'boom' fails during the database flush. Without a per-channel SAVEPOINT the
+    session is left unusable and every channel after it fails too — which is
+    exactly the bug this covers.
+    """
+    _stub_youtube(monkeypatch, explode_on="boom")
+    client.put("/api/settings", json={"youtube_api_key": "AIzaTEST"})
+
+    body = client.post("/api/channels/bulk", json={
+        "text": "@first\n@boom\n@missing\n@last", "video_limit": 50,
+    }).json()
+
+    by_ref = {r["reference"]: r for r in body["results"]}
+    assert by_ref["@first"]["status"] == "imported"
+    assert by_ref["@boom"]["status"] == "failed"
+    assert by_ref["@missing"]["status"] == "failed"
+    # The one that proves isolation: it comes after two failures.
+    assert by_ref["@last"]["status"] == "imported"
+
+    assert body["imported"] == 2
+    assert body["failed"] == 2
+
+    # And the successful ones are genuinely persisted.
+    titles = {c["title"] for c in client.get("/api/channels").json()}
+    assert "Channel first" in titles
+    assert "Channel last" in titles
+
+
+def test_bulk_import_reports_a_bad_reference_without_raw_sql(client, monkeypatch):
+    """SQLAlchemy embeds the whole statement in str(exc); a table cell can't use it."""
+    _stub_youtube(monkeypatch, explode_on="boom")
+    client.put("/api/settings", json={"youtube_api_key": "AIzaTEST"})
+
+    body = client.post("/api/channels/bulk", json={"text": "@boom"}).json()
+    message = body["results"][0]["message"]
+
+    assert "[SQL:" not in message
+    assert "\n" not in message
+    assert len(message) <= 200
+
+
+def test_bulk_import_skips_already_tracked_channels(client, monkeypatch):
+    _stub_youtube(monkeypatch)
+    client.put("/api/settings", json={"youtube_api_key": "AIzaTEST"})
+
+    first = client.post("/api/channels/bulk", json={"text": "@alpha\n@beta"}).json()
+    assert first["imported"] == 2
+
+    again = client.post("/api/channels/bulk", json={"text": "@alpha\n@beta"}).json()
+    assert again["imported"] == 0
+    assert again["skipped"] == 2
+    # Re-running a list must not re-pay for what is already stored.
+    assert again["units_spent"] <= 2
+
+
+def test_bulk_import_refuses_an_unaffordable_batch(client, monkeypatch):
+    """The per-operation cap has to apply to the batch, not per channel."""
+    _stub_youtube(monkeypatch)
+    client.put("/api/settings", json={
+        "youtube_api_key": "AIzaTEST", "per_operation_quota_cap": 10,
+    })
+
+    references = "\n".join(f"@ch{i}" for i in range(40))
+    response = client.post("/api/channels/bulk", json={
+        "text": references, "video_limit": 500,
+    })
+
+    assert response.status_code == 413
+    body = response.json()
+    assert "cap" in body["message"] or "cap" in body["hint"]
+    # Nothing may be spent by a refused operation.
+    assert client.get("/api/quota").json()["used"] == 0
+
+
+def test_bulk_import_rejects_empty_text(client):
+    client.put("/api/settings", json={"youtube_api_key": "AIzaTEST"})
+    response = client.post("/api/channels/bulk", json={"text": "   \n\n  "})
+    assert response.status_code == 400

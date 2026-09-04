@@ -57,7 +57,25 @@ input.saved, select.saved {
 .channel-name:hover { color: var(--accent); }
 
 .estimate:empty { display: none; }
+.estimate { display: flex; flex-direction: column; gap: 10px; }
 .cost-hint { margin-top: 8px; }
+
+/* Parsed reference list in the bulk-import dialog. Capped in height so a
+ * 60-channel paste doesn't push the action buttons off the screen. */
+.ref-list {
+  max-height: 190px; overflow-y: auto;
+  border: 1px solid var(--border); border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+.ref-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 7px 11px; font-size: .82rem;
+}
+.ref-row + .ref-row { border-top: 1px solid var(--border); }
+.ref-name { min-width: 0; flex: 1; }
+.ref-row.existing .ref-name { color: var(--ink-muted); }
+.ref-row.failed { border-left: 3px solid var(--critical); }
+.ref-row.not_attempted { border-left: 3px solid var(--warning); }
 
 /* ---------------------------------------------------------------- rows */
 

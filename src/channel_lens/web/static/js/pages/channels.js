@@ -9,7 +9,7 @@ import { api } from '../api.js';
 import { refreshChannels, refreshStatus, state } from '../app.js';
 import {
   el, clear, compact, full, ago, empty, notice, loading, toast, toastError,
-  modal, withBusy, badge,
+  modal, withBusy, badge, debounce,
 } from '../ui.js';
 
 export async function render(view) {
@@ -110,68 +110,169 @@ function channelRow(channel, reload) {
 
 /* ------------------------------------------------------------ add flow */
 
+/* One dialog handles both a single channel and a pasted list.
+ *
+ * There is no separate "bulk" mode to choose: a textarea accepts one reference
+ * or fifty, and the preview underneath adapts. Making the user pick the right
+ * mode before knowing how many channels they have is a decision the app can
+ * make for itself by counting lines.
+ */
 function addDialog(reload) {
-  const reference = el('input', { type: 'text', autofocus: true,
-    placeholder: '@mkbhd, a channel URL, or UC…' });
+  const input = el('textarea', {
+    autofocus: true, rows: 5, spellcheck: false,
+    placeholder: '@mkbhd\nhttps://youtube.com/@LinusTechTips\nUCXuqSBlHAE6Xw-yeJA0Tunw\n\nOne per line, or comma separated.',
+  });
+
   const limit = el('select', {},
     [['25', '25 uploads'], ['50', '50 uploads (recommended)'],
      ['100', '100 uploads'], ['200', '200 uploads'], ['500', '500 uploads']]
       .map(([v, label]) => el('option', { value: v, selected: v === '50', text: label })));
 
-  const estimate = el('div', { class: 'estimate' });
+  const skipExisting = el('input', { type: 'checkbox', checked: true });
+  const preview = el('div', { class: 'estimate' });
 
-  async function refreshEstimate() {
-    clear(estimate);
-    estimate.append(el('span', { class: 'muted small', text: 'Estimating…' }));
+  let latest = null;
+
+  async function refreshPreview() {
+    const text = input.value.trim();
+    if (!text) { clear(preview); latest = null; return; }
     try {
-      const result = await api.post('/api/channels/estimate', {
-        reference: reference.value || 'x', video_limit: Number(limit.value),
+      const result = await api.post('/api/channels/bulk/preview', {
+        text, video_limit: Number(limit.value), skip_existing: skipExisting.checked,
       });
-      clear(estimate);
-      estimate.append(
-        notice(result.affordable && result.within_cap ? 'info' : 'warning',
-          `About ${result.estimated_units} quota units`,
-          `You have ${full(result.remaining)} left today.` +
-          (result.within_cap ? '' : ` This exceeds the ${full(result.cap)}-unit per-operation cap — lower the upload count.`)));
+      latest = result;
+      clear(preview);
+      preview.append(...previewNodes(result));
     } catch (err) {
-      clear(estimate);
-      estimate.append(el('span', { class: 'muted small', text: 'Could not estimate cost.' }));
+      clear(preview);
+      preview.append(el('span', { class: 'muted small', text: 'Could not price that list.' }));
     }
   }
-  limit.onchange = refreshEstimate;
-  refreshEstimate();
+
+  const debouncedPreview = debounce(refreshPreview, 350);
+  input.oninput = debouncedPreview;
+  limit.onchange = refreshPreview;
+  skipExisting.onchange = refreshPreview;
 
   modal({
-    title: 'Add a channel',
-    subtitle: 'Paste anything YouTube gives you — a handle, a full URL, or a raw channel ID. ' +
-              'More uploads means a sturdier baseline, but costs slightly more quota.',
+    title: 'Add channels',
+    subtitle: 'Paste one channel or a whole list — handles, full URLs, or raw channel IDs, ' +
+              'in any mix. Everything is priced before anything is spent.',
     body: el('div', { class: 'stack' },
-      el('div', { class: 'field' }, el('label', { text: 'Channel' }), reference),
-      el('div', { class: 'field' }, el('label', { text: 'Import how many recent uploads?' }), limit,
+      el('div', { class: 'field' },
+        el('label', { text: 'Channels' }), input,
+        el('div', { class: 'help', text:
+          'One per line, or separated by commas. Bullets and numbering are stripped, ' +
+          'and duplicates are dropped.' })),
+      el('div', { class: 'field' },
+        el('label', { text: 'Import how many recent uploads from each?' }), limit,
         el('div', { class: 'help', text:
           '50 is enough for a stable baseline on most channels. Go higher for channels ' +
           'that upload several times a week.' })),
-      estimate),
+      el('label', { class: 'switch' }, skipExisting, el('span', { class: 'track' }),
+        el('span', { class: 'small', text: 'Skip channels already tracked' })),
+      preview),
     actions: [
       { label: 'Cancel' },
-      { label: 'Add channel', variant: 'primary', onClick: async (close) => {
-          const value = reference.value.trim();
-          if (!value) { toast('Enter a channel first.', { kind: 'warning' }); return 'keep'; }
+      { label: 'Import', variant: 'primary', onClick: async () => {
+          const text = input.value.trim();
+          if (!text) { toast('Paste at least one channel first.', { kind: 'warning' }); return 'keep'; }
+          if (latest && !latest.within_cap) {
+            toast('That import exceeds the per-operation quota cap.', { kind: 'warning',
+              hint: 'Import fewer channels at a time, or lower the uploads per channel.' });
+            return 'keep';
+          }
           try {
-            const result = await api.post('/api/channels', {
-              reference: value, video_limit: Number(limit.value),
+            const result = await api.post('/api/channels/bulk', {
+              text, video_limit: Number(limit.value), skip_existing: skipExisting.checked,
             });
             await refreshStatus();
-            toast(`Imported ${result.videos_imported} videos from ${result.channel.title}. ` +
-                  `${result.units_spent} units spent${result.cache_hits ? `, ${result.cache_hits} served from cache` : ''}.`,
-                  { kind: 'good', title: 'Channel added' });
             await reload();
+            reportResults(result);
           } catch (err) {
-            toastError(err, 'Could not add that channel');
+            toastError(err, 'Could not import those channels');
             return 'keep';
           }
         } },
     ],
+  });
+
+  // Prime the preview if something was pasted before the dialog settled.
+  setTimeout(refreshPreview, 60);
+}
+
+function previewNodes(result) {
+  const nodes = [];
+
+  if (result.truncated) {
+    nodes.push(notice('warning', `Only the first ${result.max_references} will be imported`,
+      'That is more channels than one import handles at a time. Run the rest as a second batch.'));
+  }
+
+  const parts = [`${result.parsed} found`];
+  if (result.existing) parts.push(`${result.existing} already tracked`);
+  parts.push(`${result.to_import} to import`);
+
+  nodes.push(notice(
+    result.affordable && result.within_cap ? 'info' : 'warning',
+    `${parts.join(' · ')} — about ${full(result.estimated_units)} quota units`,
+    `${result.per_channel_units} units per channel. You have ${full(result.remaining)} left today.` +
+    (result.within_cap ? ''
+      : ` This exceeds the ${full(result.cap)}-unit per-operation cap, so it will be refused.`) +
+    (!result.affordable && result.within_cap
+      ? ' There is not enough quota left today for all of them — the import will stop cleanly when it runs out.' : '')));
+
+  if (result.items.length) {
+    nodes.push(el('div', { class: 'ref-list' },
+      result.items.map((item) => el('div', { class: `ref-row ${item.status}` },
+        el('span', { class: 'ref-name truncate', text: item.reference }),
+        item.status === 'existing'
+          ? el('span', { class: 'small muted', text: item.tracked ? 'already tracked' : 'stored, not tracked' })
+          : el('span', { class: 'small muted', text: 'new' })))));
+  }
+
+  return nodes;
+}
+
+/** Report a batch outcome: a toast for the summary, a modal when rows failed. */
+function reportResults(result) {
+  const summary = `${result.imported} imported` +
+    (result.skipped ? `, ${result.skipped} skipped` : '') +
+    (result.failed ? `, ${result.failed} failed` : '') +
+    `. ${result.units_spent} units spent` +
+    (result.cache_hits ? `, ${result.cache_hits} served from cache` : '') + '.';
+
+  if (!result.failed && !result.quota_ran_out) {
+    toast(summary, { kind: 'good', title: 'Import finished' });
+    return;
+  }
+
+  // Anything that didn't import needs to be readable and re-copyable, so it
+  // gets a real list rather than a toast that vanishes in five seconds.
+  const problems = result.results.filter((r) => r.status === 'failed' || r.status === 'not_attempted');
+  modal({
+    title: 'Import finished with problems',
+    subtitle: summary,
+    body: el('div', { class: 'stack' },
+      result.quota_ran_out
+        ? notice('warning', 'The daily quota ran out partway through',
+            'Channels below marked "not attempted" were never touched. Re-run this import ' +
+            'after the quota resets and they will be picked up — anything already imported is skipped.')
+        : null,
+      el('div', { class: 'ref-list' },
+        problems.map((r) => el('div', { class: `ref-row ${r.status}` },
+          el('div', { class: 'ref-name' },
+            el('div', { class: 'truncate', text: r.reference }),
+            el('div', { class: 'small muted', text: r.message || '' }),
+            r.hint ? el('div', { class: 'small muted', text: r.hint }) : null),
+          el('span', { class: 'small muted nowrap',
+            text: r.status === 'failed' ? 'failed' : 'not attempted' })))),
+      el('div', { class: 'field' },
+        el('label', { text: 'Just the ones that did not import' }),
+        el('textarea', { rows: 3, readonly: true, spellcheck: false,
+          value: problems.map((r) => r.reference).join('\n') }),
+        el('div', { class: 'help', text: 'Copy this to retry them after fixing or waiting.' }))),
+    actions: [{ label: 'Close', variant: 'primary' }],
   });
 }
 

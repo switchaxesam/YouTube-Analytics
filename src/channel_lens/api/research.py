@@ -22,8 +22,18 @@ from ..models import (
 )
 from ..services import ingest, outliers, thumbnails, titles, tracker
 from ..services.ingest import estimate_channel_ingest_cost
-from ..youtube.client import extract_video_id
-from ..youtube.errors import NotFound, OperationTooExpensive, YouTubeError
+from ..youtube.client import (
+    extract_video_id,
+    normalise_channel_input,
+    parse_channel_references,
+)
+from ..youtube.errors import (
+    NotFound,
+    OperationTooExpensive,
+    QuotaExceeded,
+    UpstreamQuotaExceeded,
+    YouTubeError,
+)
 from .deps import get_db, ledger, youtube_client
 
 log = logging.getLogger(__name__)
@@ -144,6 +154,292 @@ def add_channel(payload: AddChannel, session: Session = Depends(get_db)) -> dict
         job.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
         session.flush()
         raise
+    finally:
+        client.close()
+
+
+class BulkAddChannels(BaseModel):
+    """A pasted list of channel references."""
+
+    text: str
+    video_limit: int = Field(default=50, ge=10, le=500)
+    #: Skip references resolving to a channel already tracked.
+    skip_existing: bool = True
+    tags: list[str] = []
+
+
+#: Upper bound on one paste. Not a quota limit — that is enforced separately —
+#: but a guard against pasting a whole spreadsheet and waiting minutes for a
+#: request that was never going to be affordable.
+MAX_BULK_REFERENCES = 100
+
+
+def _short_error(exc: Exception) -> str:
+    """One readable line from an arbitrary exception.
+
+    SQLAlchemy in particular embeds the whole failing statement and its bound
+    parameters in ``str(exc)``, which is invaluable in a log and useless in a
+    table cell. The full traceback still reaches the terminal via
+    ``log.exception``.
+
+    >>> _short_error(ValueError("something broke"))
+    'something broke'
+    >>> _short_error(RuntimeError("(sqlite3.IntegrityError) FOREIGN KEY constraint failed\\n[SQL: INSERT INTO ...]"))
+    '(sqlite3.IntegrityError) FOREIGN KEY constraint failed'
+    >>> _short_error(ValueError("x" * 300)).endswith("…")
+    True
+
+    An exception carrying no message still names itself, rather than rendering
+    as an empty cell:
+
+    >>> _short_error(ValueError(""))
+    'ValueError'
+    """
+    text = str(exc).split("\n", 1)[0].strip()
+    if not text:
+        return type(exc).__name__
+    return text if len(text) <= 200 else text[:199] + "…"
+
+
+def _existing_channel_hint(session: Session, reference: str) -> Channel | None:
+    """Best-effort match of a reference to an already-stored channel.
+
+    Cheap and deliberately approximate: it exists so the preview can say "you
+    already track this one" *before* spending a unit to resolve it. Resolution
+    during the import is what actually decides, so a miss here costs one unit,
+    and a false positive is impossible since id and handle matches are exact.
+    """
+    try:
+        kind, value = normalise_channel_input(reference)
+    except ValueError:
+        return None
+    if kind == "id":
+        return session.get(Channel, value)
+    handle = value.lstrip("@").lower()
+    if not handle:
+        return None
+    return session.scalar(
+        select(Channel).where(
+            func.lower(func.replace(func.coalesce(Channel.handle, ""), "@", "")) == handle
+        )
+    )
+
+
+@router.post("/channels/bulk/preview")
+def bulk_preview(
+    payload: BulkAddChannels, session: Session = Depends(get_db)
+) -> dict[str, Any]:
+    """Parse the pasted text and price the import, spending nothing.
+
+    Always shown before the import runs. A bulk action that starts spending
+    quota the moment you paste is precisely the behaviour this app exists to
+    avoid.
+    """
+    config = get_settings()
+    references = parse_channel_references(payload.text)
+    truncated = len(references) > MAX_BULK_REFERENCES
+    references = references[:MAX_BULK_REFERENCES]
+
+    items: list[dict[str, Any]] = []
+    new_count = 0
+    for reference in references:
+        existing = _existing_channel_hint(session, reference)
+        if existing is not None:
+            items.append({
+                "reference": reference, "status": "existing",
+                "channel_title": existing.title, "tracked": existing.is_tracked,
+            })
+        else:
+            new_count += 1
+            items.append({"reference": reference, "status": "new"})
+
+    to_import = new_count if payload.skip_existing else len(references)
+    per_channel = estimate_channel_ingest_cost(payload.video_limit) + 1
+    estimated = to_import * per_channel
+    status = ledger(config).status(session)
+
+    return {
+        "items": items,
+        "parsed": len(references),
+        "new": new_count,
+        "existing": len(references) - new_count,
+        "to_import": to_import,
+        "per_channel_units": per_channel,
+        "estimated_units": estimated,
+        "remaining": status.remaining,
+        "affordable": estimated <= status.remaining,
+        "cap": config.per_operation_quota_cap,
+        "within_cap": estimated <= config.per_operation_quota_cap,
+        "truncated": truncated,
+        "max_references": MAX_BULK_REFERENCES,
+    }
+
+
+@router.post("/channels/bulk")
+def bulk_add_channels(
+    payload: BulkAddChannels, session: Session = Depends(get_db)
+) -> dict[str, Any]:
+    """Import many channels, reporting each one's outcome separately.
+
+    Two rules make this survivable.
+
+    **One bad reference never stops the run.** A typo, a deleted channel, or a
+    vanity URL the API refuses to resolve is recorded against that row and the
+    loop continues. A batch that dies on item three, having already spent quota
+    on one and two, is the worst available outcome.
+
+    **Quota is re-checked before every channel, not once up front.** The
+    estimate is a forecast; real spend varies with how many uploads a channel
+    actually has and how much was already cached. When the budget runs out the
+    run stops cleanly and names the channels never attempted, rather than
+    failing them one by one against an exhausted API.
+    """
+    config = get_settings()
+    references = parse_channel_references(payload.text)[:MAX_BULK_REFERENCES]
+    if not references:
+        raise HTTPException(
+            status_code=400, detail="No channel references found in that text."
+        )
+
+    per_channel = estimate_channel_ingest_cost(payload.video_limit) + 1
+    total_estimate = len(references) * per_channel
+    if total_estimate > config.per_operation_quota_cap:
+        raise OperationTooExpensive(
+            f"Importing {len(references)} channels at {payload.video_limit} uploads "
+            f"each would cost about {total_estimate:,} units, over the "
+            f"{config.per_operation_quota_cap:,}-unit per-operation cap.",
+            "Import fewer at a time, lower the uploads per channel, or raise the cap "
+            "in Settings.",
+        )
+
+    job = JobRun(job="channel.bulk_add", status="running",
+                 detail=f"{len(references)} references")
+    session.add(job)
+    session.flush()
+
+    client = youtube_client(session, config)
+    results: list[dict[str, Any]] = []
+    imported = failed = skipped = 0
+    quota_ran_out = False
+
+    try:
+        for reference in references:
+            if quota_ran_out or not ledger(config).can_afford(session, per_channel):
+                quota_ran_out = True
+                results.append({
+                    "reference": reference, "status": "not_attempted",
+                    "message": "Stopped before this one — the daily quota ran out.",
+                })
+                skipped += 1
+                continue
+
+            try:
+                raw = client.resolve_channel(reference)
+            except (QuotaExceeded, UpstreamQuotaExceeded) as exc:
+                # Not this row's fault; end the run rather than burning the
+                # rest of the list against an exhausted API.
+                quota_ran_out = True
+                results.append({"reference": reference, "status": "not_attempted",
+                                "message": exc.message})
+                skipped += 1
+                continue
+            except YouTubeError as exc:
+                results.append({"reference": reference, "status": "failed",
+                                "message": exc.message, "hint": exc.hint})
+                failed += 1
+                continue
+
+            existing = session.get(Channel, raw["id"])
+            if existing is not None and existing.is_tracked and payload.skip_existing:
+                results.append({
+                    "reference": reference, "status": "skipped",
+                    "channel_id": existing.id, "channel_title": existing.title,
+                    "message": "Already tracked.",
+                })
+                skipped += 1
+                continue
+
+            # Each channel writes inside its own SAVEPOINT. Catching the
+            # exception is not enough on its own: any error during a flush
+            # leaves the session in a rolled-back state where every later
+            # statement raises PendingRollbackError, so a single bad channel
+            # would silently fail the whole rest of the batch. The savepoint is
+            # what actually delivers the per-row isolation this loop promises.
+            units_before = client.units_spent
+            savepoint = session.begin_nested()
+            try:
+                channel = ingest.upsert_channel(session, raw, is_tracked=True)
+                if payload.tags:
+                    channel.tags = payload.tags
+                videos, _revisions = ingest.ingest_channel_uploads(
+                    client, session, channel, limit=payload.video_limit,
+                    shorts_max_seconds=config.shorts_max_seconds,
+                )
+                titles.analyse_and_store(session, videos)
+                outliers.score_channel(
+                    session, channel.id, window=config.baseline_window,
+                    min_age_days=config.baseline_min_age_days,
+                    min_videos=config.baseline_min_videos,
+                    outlier_threshold=config.outlier_threshold,
+                )
+                savepoint.commit()
+                results.append({
+                    "reference": reference, "status": "imported",
+                    "channel_id": channel.id, "channel_title": channel.title,
+                    "videos": len(videos),
+                })
+                imported += 1
+            except BaseException as exc:  # noqa: BLE001 - re-raised below if unknown
+                savepoint.rollback()
+
+                # Rolling back also discards this channel's quota bookings, but
+                # those units were genuinely spent — the requests went out. Re-book
+                # them, because the ledger is allowed to over-count and must never
+                # under-count.
+                wasted = client.units_spent - units_before
+                if wasted:
+                    ledger(config).record_units(session, "failed_import", wasted)
+
+                if isinstance(exc, (QuotaExceeded, UpstreamQuotaExceeded)):
+                    quota_ran_out = True
+                    results.append({"reference": reference, "status": "failed",
+                                    "message": exc.message, "hint": exc.hint})
+                elif isinstance(exc, YouTubeError):
+                    results.append({"reference": reference, "status": "failed",
+                                    "message": exc.message, "hint": exc.hint})
+                elif isinstance(exc, Exception):
+                    log.exception("Bulk import failed for %s", reference)
+                    results.append({"reference": reference, "status": "failed",
+                                    "message": _short_error(exc),
+                                    "hint": "The full traceback is in the terminal "
+                                            "running Channel Lens."})
+                else:
+                    # KeyboardInterrupt / SystemExit: the savepoint is unwound,
+                    # now let it out rather than swallowing a shutdown.
+                    raise
+                failed += 1
+
+        job.status = "error" if (failed and not imported) else "ok"
+        job.items_processed = imported
+        job.units_spent = client.units_spent
+        job.detail = (
+            f"Imported {imported}, skipped {skipped}, failed {failed} "
+            f"of {len(references)}."
+        )
+        if failed:
+            job.error = "; ".join(
+                f"{r['reference']}: {r.get('message', '')}"
+                for r in results if r["status"] == "failed"
+            )[:2000]
+        job.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        session.flush()
+
+        return {
+            "results": results, "imported": imported, "skipped": skipped,
+            "failed": failed, "total": len(references),
+            "units_spent": client.units_spent, "cache_hits": client.cache_hits,
+            "quota_ran_out": quota_ran_out,
+        }
     finally:
         client.close()
 

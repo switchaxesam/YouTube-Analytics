@@ -194,6 +194,69 @@ def normalise_channel_input(raw: str) -> tuple[str, str]:
     return "handle", f"@{text}"
 
 
+def parse_channel_references(text: str) -> list[str]:
+    r"""Split pasted text into channel references, preserving order.
+
+    People paste lists from wherever they collected them, so this accepts one
+    per line, comma or semicolon separated, bulleted, numbered, or a mix, and
+    tolerates the tab-separated leftovers of a spreadsheet copy. Order is kept
+    because the parsed result is shown back for confirmation, and a list that
+    silently reorders itself looks like it lost something.
+
+    >>> parse_channel_references("@mkbhd\n@mkbhd\n@ltt")
+    ['@mkbhd', '@ltt']
+    >>> parse_channel_references("@a, @b; @c")
+    ['@a', '@b', '@c']
+    >>> parse_channel_references("- @a\n2. @b\n  * @c  ")
+    ['@a', '@b', '@c']
+    >>> parse_channel_references("")
+    []
+
+    Duplicates are dropped case-insensitively, since handles are not
+    case-sensitive and paying twice to import one channel is pure waste:
+
+    >>> parse_channel_references("@MKBHD\n@mkbhd")
+    ['@MKBHD']
+
+    A pasted URL keeps its whole path -- the separator split must never cut one
+    in half:
+
+    >>> parse_channel_references("https://youtube.com/@a/videos\nhttps://youtube.com/@b")
+    ['https://youtube.com/@a/videos', 'https://youtube.com/@b']
+
+    Spreadsheet columns arrive tab separated, so extra cells surface as their
+    own entries rather than being glued onto the handle. They fail to resolve
+    individually and are reported per row, which is easier to understand than
+    one silently corrupted reference:
+
+    >>> parse_channel_references("@a\tsome note")
+    ['@a', 'some note']
+    """
+    references: list[str] = []
+    seen: set[str] = set()
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        # Strip list decoration: bullets, dashes, "1." / "1)" numbering.
+        line = re.sub(r"^\s*(?:[-*\u2022]|\d+[.)])\s+", "", line)
+
+        # Split only on characters that cannot appear inside a YouTube
+        # reference. A URL contains neither a comma nor a semicolon.
+        for part in re.split(r"[,;\t]+", line):
+            candidate = part.strip().strip("\"'")
+            if not candidate:
+                continue
+            key = candidate.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            references.append(candidate)
+
+    return references
+
+
 def extract_video_id(raw: str) -> str | None:
     """Pull a video id out of any YouTube URL shape, or accept a bare id.
 

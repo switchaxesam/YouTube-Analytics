@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import logging
 import socket
+import sys
 import threading
 import webbrowser
 
@@ -45,7 +46,29 @@ def _pick_port(preferred: int) -> int:
         return sock.getsockname()[1]
 
 
+def _make_console_unicode_safe() -> None:
+    """Stop a non-UTF-8 console from crashing the app on a stray character.
+
+    Windows consoles frequently default to cp1252, which cannot encode most of
+    what this app prints. That is not a cosmetic problem: an un-encodable
+    character raises ``UnicodeEncodeError`` from ``print`` or from a log
+    handler, and on startup it kills the process outright.
+
+    YouTube titles and channel names routinely contain emoji, CJK, and dashes
+    that cp1252 has no mapping for, so this is a matter of when rather than if.
+    UTF-8 is requested, and ``errors="replace"`` guarantees that even a console
+    that refuses it degrades to a replacement character instead of an exception.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            # Redirected to something that can't be reconfigured; nothing to do.
+            pass
+
+
 def main() -> None:
+    _make_console_unicode_safe()
     parser = argparse.ArgumentParser(prog="channel-lens", description=__doc__)
     parser.add_argument("--port", type=int, default=None, help="Port to serve on.")
     parser.add_argument("--no-browser", action="store_true", help="Don't open a browser.")
