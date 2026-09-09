@@ -291,6 +291,123 @@ def test_quota_day_follows_pacific_not_local():
     assert quota_day(datetime(2026, 3, 2, 9, 0, tzinfo=timezone.utc)).day == 2
 
 
+# ----------------------------------------------------------- OAuth refresh
+
+
+def _write_token(expiry, *, refresh_token="refresh-abc"):
+    """Write a stored credential file the way exchange_code does."""
+    import json
+
+    from channel_lens.config import oauth_token_path
+
+    oauth_token_path().write_text(json.dumps({
+        "token": "stale-access-token",
+        "refresh_token": refresh_token,
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "client_id": "cid.apps.googleusercontent.com",
+        "client_secret": "GOCSPX-secret",
+        "scopes": ["https://www.googleapis.com/auth/yt-analytics.readonly"],
+        "expiry": expiry,
+    }), encoding="utf-8")
+
+
+def test_an_expired_access_token_is_refreshed(monkeypatch):
+    """The failure that shipped: it worked for an hour, then 401ed forever.
+
+    The expiry was saved but never passed back when rebuilding the
+    credentials, so google-auth believed the token never expired, reported it
+    valid, and kept sending a dead token.
+    """
+    from channel_lens.youtube import analytics
+
+    _write_token((datetime.now(timezone.utc) - timedelta(hours=2))
+                 .replace(tzinfo=None).isoformat())
+
+    refreshed = {"called": False}
+
+    def fake_refresh(self, _request):
+        refreshed["called"] = True
+        self.token = "fresh-access-token"
+        self.expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).replace(tzinfo=None)
+
+    from google.oauth2.credentials import Credentials
+    monkeypatch.setattr(Credentials, "refresh", fake_refresh)
+
+    credentials = analytics.load_credentials()
+
+    assert refreshed["called"] is True
+    assert credentials.token == "fresh-access-token"
+
+
+def test_a_token_with_no_recorded_expiry_is_refreshed(monkeypatch):
+    """Credentials written by the broken version have no usable expiry.
+
+    Treating those as valid is what left the connection permanently dead, so
+    an unknown expiry has to mean "refresh", not "fine".
+    """
+    from google.oauth2.credentials import Credentials
+
+    from channel_lens.youtube import analytics
+
+    _write_token(None)
+
+    calls = {"n": 0}
+
+    def fake_refresh(self, _request):
+        calls["n"] += 1
+        self.token = "recovered-token"
+        self.expiry = (datetime.now(timezone.utc) + timedelta(hours=1)).replace(tzinfo=None)
+
+    monkeypatch.setattr(Credentials, "refresh", fake_refresh)
+
+    assert analytics.load_credentials().token == "recovered-token"
+    assert calls["n"] == 1
+
+
+def test_a_still_valid_token_is_not_refreshed(monkeypatch):
+    """Refreshing on every call would be wasteful and rate-limited."""
+    from google.oauth2.credentials import Credentials
+
+    from channel_lens.youtube import analytics
+
+    _write_token((datetime.now(timezone.utc) + timedelta(minutes=50))
+                 .replace(tzinfo=None).isoformat())
+
+    def fail_refresh(self, _request):
+        raise AssertionError("should not refresh a token that is still good")
+
+    monkeypatch.setattr(Credentials, "refresh", fail_refresh)
+
+    assert analytics.load_credentials().token == "stale-access-token"
+
+
+def test_a_refresh_failure_says_access_may_be_revoked(monkeypatch):
+    from google.oauth2.credentials import Credentials
+
+    from channel_lens.youtube import analytics
+
+    _write_token(None)
+
+    def broken_refresh(self, _request):
+        raise RuntimeError("invalid_grant")
+
+    monkeypatch.setattr(Credentials, "refresh", broken_refresh)
+
+    with pytest.raises(analytics.NotAuthorised) as caught:
+        analytics.load_credentials()
+    assert "revoked" in caught.value.message
+
+
+def test_a_credential_without_a_refresh_token_explains_itself():
+    from channel_lens.youtube import analytics
+
+    _write_token(None, refresh_token=None)
+
+    with pytest.raises(analytics.NotAuthorised) as caught:
+        analytics.load_credentials()
+    assert "refresh token" in caught.value.message
+
+
 # --------------------------------------------------- local thumbnail metrics
 
 

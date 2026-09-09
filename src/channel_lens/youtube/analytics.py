@@ -342,6 +342,8 @@ def load_credentials():
     except (OSError, json.JSONDecodeError) as exc:
         raise NotAuthorised("Stored credentials are unreadable.") from exc
 
+    stored_expiry = _parse_expiry(data.get("expiry"))
+
     credentials = Credentials(
         token=data.get("token"),
         refresh_token=data.get("refresh_token"),
@@ -349,9 +351,19 @@ def load_credentials():
         client_id=data.get("client_id"),
         client_secret=data.get("client_secret"),
         scopes=data.get("scopes") or SCOPES,
+        # Passing this back is what makes the refresh below ever happen.
+        # Without it google-auth has no idea the token expires, reports the
+        # credentials as valid forever, and quietly sends an hour-old access
+        # token that Google rejects with "invalid authentication credentials".
+        expiry=stored_expiry,
     )
 
-    if not credentials.valid:
+    # An unknown expiry is treated as expired rather than as "fine". Tokens
+    # written before the expiry was round-tripped have none, and assuming those
+    # are good is exactly the bug that shipped.
+    needs_refresh = stored_expiry is None or not credentials.valid
+
+    if needs_refresh:
         if not credentials.refresh_token:
             raise NotAuthorised(
                 "The stored connection has no refresh token, so it can't be renewed."
@@ -367,6 +379,39 @@ def load_credentials():
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     return credentials
+
+
+def _parse_expiry(raw: str | None) -> datetime | None:
+    """Read a stored expiry back as the naive UTC datetime google-auth expects.
+
+    ``google.oauth2.credentials.Credentials`` compares ``expiry`` against a
+    naive ``utcnow()``, so handing it an aware datetime raises when it checks
+    whether the token has expired.
+
+    >>> _parse_expiry("2026-09-09T04:12:33.123456")
+    datetime.datetime(2026, 9, 9, 4, 12, 33, 123456)
+
+    An aware timestamp is converted to UTC and stripped, rather than rejected:
+
+    >>> _parse_expiry("2026-09-09T06:12:33+02:00")
+    datetime.datetime(2026, 9, 9, 4, 12, 33)
+
+    Anything unusable reads as "unknown", which the caller treats as expired:
+
+    >>> _parse_expiry(None) is None
+    True
+    >>> _parse_expiry("not a timestamp") is None
+    True
+    """
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
 
 
 def disconnect() -> None:
