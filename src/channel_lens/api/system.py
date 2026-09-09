@@ -68,6 +68,9 @@ def status(session: Session = Depends(get_db)) -> dict[str, Any]:
         "settings": config.redacted(),
         "quota": quota.to_dict(),
         "missing": config.missing_requirements(),
+        # The sidebar badge counts only genuine blockers. Counting optional
+        # extras made the app look like it needed a paid API key it does not.
+        "required_missing": len(config.required_gaps()),
         "oauth": oauth,
         "ready": config.has_data_api,
     }

@@ -30,7 +30,7 @@ export async function refreshStatus() {
     state.status = await api.get('/api/status');
     applyTheme(state.status.settings.theme);
     renderQuota(state.status.quota);
-    renderSetupBadge(state.status.missing);
+    renderSetupBadge(state.status.required_missing ?? 0);
   } catch (err) {
     toastError(err, 'Could not load app status');
   }
@@ -71,11 +71,12 @@ export function renderQuota(quota) {
     `${full(quota.used)} of ${full(quota.budget)} units used today. Resets in ${quota.resets_in}.`;
 }
 
-function renderSetupBadge(missing) {
+/** Only genuine blockers earn a badge; optional extras are not chores. */
+function renderSetupBadge(count) {
   const badge = document.getElementById('nav-badge-setup');
-  const count = (missing || []).length;
-  badge.hidden = count === 0;
+  badge.hidden = !count;
   badge.textContent = String(count);
+  badge.title = `${count} required setting still needs configuring`;
 }
 
 /** Nudge toward the tracker when competitors have changed something recently. */

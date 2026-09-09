@@ -241,17 +241,23 @@ class Settings:
     def has_oauth_client(self) -> bool:
         return bool(self.google_client_id and self.google_client_secret)
 
-    def missing_requirements(self) -> list[dict[str, str]]:
-        """Human-readable list of what isn't configured and what it unlocks.
+    def missing_requirements(self) -> list[dict[str, Any]]:
+        """What isn't configured, what it actually costs you, and how to fix it.
 
-        Drives the empty states, so an unconfigured app explains itself instead
-        of just failing.
+        Each gap says whether it is ``required``. That distinction matters more
+        than it looks: exactly one credential here is genuinely needed, and
+        listing an optional extra beside a real blocker makes the app look like
+        it demands more than it does. That is the wrong impression for any
+        setup step, and badly wrong for the one that costs money — a user can
+        reasonably conclude a screen is unusable without paying, when it isn't.
         """
-        gaps: list[dict[str, str]] = []
+        gaps: list[dict[str, Any]] = []
         if not self.has_data_api:
             gaps.append(
                 {
                     "key": "youtube_api_key",
+                    "required": True,
+                    "cost": "free",
                     "blocks": "Everything that reads public YouTube data: outliers, tracking, thumbnail and title analysis.",
                     "fix": "Create a YouTube Data API v3 key in Google Cloud, then paste it into Settings.",
                 }
@@ -260,6 +266,8 @@ class Settings:
             gaps.append(
                 {
                     "key": "owned_channel_id",
+                    "required": False,
+                    "cost": "free",
                     "blocks": "The My Channel dashboard, and 'compare against my videos' on every other screen.",
                     "fix": "Paste your channel ID (or @handle) into Settings.",
                 }
@@ -268,6 +276,8 @@ class Settings:
             gaps.append(
                 {
                     "key": "google_oauth",
+                    "required": False,
+                    "cost": "free",
                     "blocks": "Real CTR, impressions, and retention for your own videos. No external tool can supply these.",
                     "fix": "Create an OAuth 2.0 'Desktop app' client in the same Google Cloud project, then connect in Settings.",
                 }
@@ -276,11 +286,20 @@ class Settings:
             gaps.append(
                 {
                     "key": "anthropic_api_key",
-                    "blocks": "AI thumbnail breakdowns and title curiosity scoring. Colour, text-area, and all deterministic title metrics still work without it.",
-                    "fix": "Paste an Anthropic API key into Settings.",
+                    "required": False,
+                    "cost": "paid",
+                    "blocks": "Only the written description of what each thumbnail shows — faces, expression, "
+                              "overlaid text, and a legibility read.",
+                    "fix": "Entirely optional, and the only thing here that costs anything. Packaging works without "
+                           "it: every title metric, plus thumbnail colour, contrast, brightness and busyness, is "
+                           "measured on your own machine for free.",
                 }
             )
         return gaps
+
+    def required_gaps(self) -> list[dict[str, Any]]:
+        """Only the gaps that genuinely stop the app working."""
+        return [gap for gap in self.missing_requirements() if gap.get("required")]
 
 
 _cached: Settings | None = None

@@ -94,6 +94,7 @@ async function thumbnailsView(reload) {
   }
 
   const unanalysed = outliers.results.filter((r) => r.thumbnail_url);
+  const hasVision = state.status?.settings?.anthropic_api_key_set;
   const analyseBtn = el('button', { class: 'btn primary' },
     `Analyse ${unanalysed.length} thumbnails`);
   analyseBtn.onclick = () => withBusy(analyseBtn, 'Analysing…', async () => {
@@ -120,14 +121,26 @@ async function thumbnailsView(reload) {
           : 'Nothing analysed yet' })),
     analyseBtn));
 
+  if (!hasVision) {
+    // Say plainly that this screen works unpaid. Without this, "analyse"
+    // beside an unset API key reads as a paywall, and it isn't one.
+    nodes.push(notice('info', 'This works without an API key',
+      'Colour, contrast, brightness and busyness are measured on your own machine, ' +
+      'and every title metric is computed locally. An Anthropic key is optional — it ' +
+      'adds a written description of what each thumbnail shows (faces, expression, ' +
+      'overlaid text, legibility at sidebar size), billed per image and cached forever.'));
+  }
+
   if (!high.sample_size) {
     nodes.push(el('div', { class: 'card' }, el('div', { class: 'card-body' },
       empty({
         title: 'Nothing analysed yet',
-        message: 'Analysing measures colour, contrast and busyness locally for free. With ' +
-                 'an Anthropic key it also describes what each thumbnail shows — faces, ' +
-                 'expressions, text, and how well it reads at sidebar size. Each image is ' +
-                 'analysed once and cached forever.',
+        message: hasVision
+          ? 'Analysing measures colour, contrast and busyness locally, and describes what ' +
+            'each thumbnail shows. Each image is analysed once and cached forever.'
+          : 'Analysing measures colour, contrast, brightness and busyness on your own ' +
+            'machine — free, and the metrics that actually predict whether a thumbnail ' +
+            'survives being shrunk to sidebar size.',
         actions: [{ label: 'Analyse now', variant: 'primary', onClick: () => analyseBtn.click() }],
       }))));
   } else {

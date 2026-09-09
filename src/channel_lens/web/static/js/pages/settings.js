@@ -11,7 +11,7 @@
 
 import { api } from '../api.js';
 import { applyTheme, refreshStatus, state } from '../app.js';
-import { el, toast, toastError, notice, withBusy, modal, badge } from '../ui.js';
+import { el, toast, toastError, notice, withBusy, modal, badge, ICON } from '../ui.js';
 
 export async function render(view) {
   const status = state.status || await refreshStatus();
@@ -28,13 +28,23 @@ export async function render(view) {
         'file on this computer.' }))));
 
   if (status.missing?.length) {
+    const required = status.missing.filter((g) => g.required);
+    const optional = status.missing.filter((g) => !g.required);
+
     page.append(el('div', { class: 'card' },
       el('div', { class: 'card-head' },
-        el('div', {}, el('h2', { text: 'Setup' }),
-          el('div', { class: 'sub', text: `${status.missing.length} thing${status.missing.length === 1 ? '' : 's'} not configured yet` }))),
+        el('div', {},
+          el('h2', { text: 'Setup' }),
+          el('div', { class: 'sub', text:
+            required.length
+              ? `${required.length} required, ${optional.length} optional`
+              : 'Everything required is configured' }))),
       el('div', { class: 'card-body stack' },
-        status.missing.map((gap) =>
-          notice('warning', gap.blocks, '', gap.fix)))));
+        // Required blockers first, then optional extras clearly marked as
+        // such — an optional item shown as a warning reads as a chore.
+        required.map((gap) => notice('warning', gap.blocks, '', gap.fix)),
+        optionalGaps(optional),
+      )));
   }
 
   page.append(credentialsCard(settings));
@@ -46,6 +56,30 @@ export async function render(view) {
   page.append(aboutCard());
 
   view.append(page);
+}
+
+/** Optional setup items, each labelled free or paid.
+ *
+ * Kept out of the main tree because deep inline nesting is where an unbalanced
+ * paren hides — this exact block shipped with one missing and took the whole
+ * Settings page down.
+ */
+function optionalGaps(gaps) {
+  if (!gaps.length) return null;
+
+  const row = (gap) => el('div', { class: 'notice info' },
+    el('div', { class: 'icon', html: ICON.info }),
+    el('div', {},
+      el('div', { class: 'row mb-sm' },
+        el('strong', { text: gap.blocks }),
+        gap.cost === 'paid'
+          ? badge('costs money', 'warning', 'alert')
+          : badge('free', 'good', 'check')),
+      el('p', { class: 'fix', text: gap.fix })));
+
+  return el('div', {},
+    el('h3', { class: 'mb-sm', text: 'Optional' }),
+    el('div', { class: 'stack' }, gaps.map(row)));
 }
 
 /* ----------------------------------------------------------- primitives */

@@ -39,6 +39,40 @@ def test_status_works_with_no_configuration(client):
         assert gap["blocks"] and gap["fix"]
 
 
+def test_only_the_youtube_key_is_actually_required(client):
+    """The paid Anthropic key must never be presented as a blocker.
+
+    It was, which made the Packaging screen look like it needed a paid API key
+    to work at all. It does not: every title metric and the local thumbnail
+    measurements run without one.
+    """
+    body = client.get("/api/status").json()
+    gaps = {gap["key"]: gap for gap in body["missing"]}
+
+    assert gaps["youtube_api_key"]["required"] is True
+    assert gaps["anthropic_api_key"]["required"] is False
+    assert gaps["google_oauth"]["required"] is False
+    assert gaps["owned_channel_id"]["required"] is False
+
+    # The sidebar badge counts blockers only.
+    assert body["required_missing"] == 1
+
+    # And the one paid item says so, in the text the user actually reads.
+    assert gaps["anthropic_api_key"]["cost"] == "paid"
+    assert all(g["cost"] == "free" for k, g in gaps.items() if k != "anthropic_api_key")
+    assert "without it" in gaps["anthropic_api_key"]["fix"]
+
+
+def test_configuring_the_youtube_key_clears_the_setup_badge(client):
+    client.put("/api/settings", json={"youtube_api_key": "AIzaTESTKEY123"})
+    body = client.get("/api/status").json()
+
+    assert body["required_missing"] == 0
+    assert body["ready"] is True
+    # Optional suggestions remain listed, just not as blockers.
+    assert body["missing"]
+
+
 def test_secrets_never_leave_the_process(client):
     client.put("/api/settings", json={"youtube_api_key": "AIzaSyTOPSECRETVALUE"})
     body = client.get("/api/settings").json()
