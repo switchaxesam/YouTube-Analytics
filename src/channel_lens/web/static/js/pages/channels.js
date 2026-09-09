@@ -12,6 +12,12 @@ import {
   modal, withBusy, badge, debounce,
 } from '../ui.js';
 
+/* The progress panel lives above the channel list and is driven by polling.
+ * Module-scoped so that navigating away and back re-attaches to a running
+ * import rather than losing sight of it. */
+const progressPanel = el('div', { class: 'progress-slot' });
+let pollTimer = null;
+
 export async function render(view) {
   const list = el('div', { class: 'stack' });
 
@@ -23,8 +29,9 @@ export async function render(view) {
         'performance baseline, which is what every multiplier in the app is measured ' +
         'against.' })),
     el('div', { class: 'page-actions' },
-      el('button', { class: 'btn primary', onClick: () => addDialog(reload) }, 'Add channel'))));
+      el('button', { class: 'btn primary', onClick: () => addDialog(reload) }, 'Add channels'))));
 
+  view.append(progressPanel);
   view.append(list);
 
   async function reload() {
@@ -36,6 +43,99 @@ export async function render(view) {
   }
 
   await reload();
+
+  // An import started before this page was opened (or before a navigation
+  // away) is still running on the server; pick it back up.
+  try {
+    const live = await api.get('/api/jobs/live', { name: 'channel.bulk_add' });
+    if (live.running) watchImport(live.id, reload);
+  } catch { /* nothing in flight */ }
+
+  // Stop polling when the route changes; render() re-attaches on return.
+  return () => { clearTimeout(pollTimer); pollTimer = null; };
+}
+
+/** Poll a running import and keep the progress panel in step with it. */
+function watchImport(jobId, reload) {
+  clearTimeout(pollTimer);
+  let lastDone = -1;
+  paintProgress({ done: 0, total: 0, current: 'Starting…', fraction: 0, running: true }, jobId);
+
+  const tick = async () => {
+    let job;
+    try {
+      job = await api.get(`/api/jobs/live/${jobId}`);
+    } catch (err) {
+      clear(progressPanel);
+      toastError(err, 'Lost track of the import');
+      return;
+    }
+
+    paintProgress(job, jobId);
+
+    if (job.running) {
+      // Refresh the list as channels land, rather than leaving "no channels
+      // tracked yet" on screen while they are visibly being imported.
+      if (job.done !== lastDone) {
+        lastDone = job.done;
+        if (job.done > 0) await reload();
+      }
+      pollTimer = setTimeout(tick, 900);
+      return;
+    }
+
+    // Finished: clear the panel, refresh the list, and report.
+    clear(progressPanel);
+    await refreshStatus();
+    await reload();
+
+    if (job.status === 'error') {
+      toast(job.error || 'The import failed.', { kind: 'critical', title: 'Import failed' });
+    } else if (job.result) {
+      reportResults(job.result);
+    }
+  };
+
+  pollTimer = setTimeout(tick, 250);
+}
+
+function paintProgress(job, jobId) {
+  clear(progressPanel);
+
+  const pct = Math.round((job.fraction || 0) * 100);
+  const counted = job.total ? `${job.done} of ${job.total}` : 'Starting…';
+
+  const cancelBtn = el('button', { class: 'btn ghost sm', text: 'Cancel' });
+  cancelBtn.onclick = async () => {
+    cancelBtn.disabled = true;
+    cancelBtn.textContent = 'Stopping…';
+    try {
+      const res = await api.post(`/api/jobs/live/${jobId}/cancel`);
+      toast(res.message, { kind: 'info' });
+    } catch (err) { toastError(err); }
+  };
+
+  progressPanel.append(el('div', { class: 'card progress-card' },
+    el('div', { class: 'card-body' },
+      el('div', { class: 'between mb-sm' },
+        el('div', { class: 'row' },
+          el('div', { class: 'spinner' }),
+          el('div', {},
+            el('div', { class: 'progress-title', text: 'Importing channels' }),
+            el('div', { class: 'small muted truncate',
+              text: job.current ? `Now: ${job.current}` : 'Working…' }))),
+        el('div', { class: 'row' },
+          el('span', { class: 'small tnum muted', text: counted }),
+          job.running ? cancelBtn : null)),
+      el('div', { class: 'meter lg' },
+        el('div', { class: 'meter-fill',
+          // A zero-total job would divide by zero; show an indeterminate sliver.
+          style: { width: job.total ? `${pct}%` : '8%' } })),
+      el('div', { class: 'small muted mt-sm', text:
+        job.cancel_requested
+          ? 'Stopping after the current channel finishes.'
+          : 'This keeps running if you switch pages. Each channel is saved as it completes.' }),
+    )));
 }
 
 function renderChannels(reload) {
@@ -183,14 +283,15 @@ function addDialog(reload) {
             return 'keep';
           }
           try {
-            const result = await api.post('/api/channels/bulk', {
+            // Returns as soon as the job is queued. The dialog closes and the
+            // progress panel on the page takes over, so a long import is
+            // visible and the rest of the app stays usable.
+            const started = await api.post('/api/channels/bulk', {
               text, video_limit: Number(limit.value), skip_existing: skipExisting.checked,
             });
-            await refreshStatus();
-            await reload();
-            reportResults(result);
+            watchImport(started.job_id, reload);
           } catch (err) {
-            toastError(err, 'Could not import those channels');
+            toastError(err, 'Could not start that import');
             return 'keep';
           }
         } },
@@ -242,7 +343,7 @@ function reportResults(result) {
     `. ${result.units_spent} units spent` +
     (result.cache_hits ? `, ${result.cache_hits} served from cache` : '') + '.';
 
-  if (!result.failed && !result.quota_ran_out) {
+  if (!result.failed && !result.quota_ran_out && !result.cancelled) {
     toast(summary, { kind: 'good', title: 'Import finished' });
     return;
   }
@@ -251,9 +352,14 @@ function reportResults(result) {
   // gets a real list rather than a toast that vanishes in five seconds.
   const problems = result.results.filter((r) => r.status === 'failed' || r.status === 'not_attempted');
   modal({
-    title: 'Import finished with problems',
+    title: result.cancelled ? 'Import cancelled' : 'Import finished with problems',
     subtitle: summary,
     body: el('div', { class: 'stack' },
+      result.cancelled
+        ? notice('info', 'Stopped on request',
+            'Channels marked "not attempted" were never reached. Anything already ' +
+            'imported is saved and will be skipped if you run the list again.')
+        : null,
       result.quota_ran_out
         ? notice('warning', 'The daily quota ran out partway through',
             'Channels below marked "not attempted" were never touched. Re-run this import ' +

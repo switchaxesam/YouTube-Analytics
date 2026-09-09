@@ -22,15 +22,20 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[P
     # The engine and settings are process-wide singletons; drop both so they
     # rebuild against this test's directory rather than a previous test's.
     from channel_lens import config, db
+    from channel_lens.services import jobs
 
     db.reset_state_for_tests()
     config._cached = None
+    # Background jobs are process-global; a leftover "running" job would make
+    # the next test's import be refused as a duplicate.
+    jobs.reset_for_tests()
     db.init_db()
 
     yield home
 
     db.reset_state_for_tests()
     config._cached = None
+    jobs.reset_for_tests()
 
 
 @pytest.fixture

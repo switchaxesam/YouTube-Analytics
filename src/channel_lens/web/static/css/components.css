@@ -56,6 +56,16 @@ input.saved, select.saved {
 .channel-name { font-weight: 600; font-size: .9rem; }
 .channel-name:hover { color: var(--accent); }
 
+/* Live import progress. Sits above the channel list rather than inside the
+ * dialog, so the dialog can close the moment the job is accepted and the rest
+ * of the app stays usable while it runs. */
+.progress-slot:empty { display: none; }
+.progress-slot { margin-bottom: 16px; }
+.progress-card { border-color: rgba(42, 120, 214, .35); }
+.progress-title { font-weight: 600; font-size: .9rem; }
+.meter.lg { height: 8px; margin: 4px 0 0; }
+.meter.lg .meter-fill { transition: width .45s var(--ease); }
+
 .estimate:empty { display: none; }
 .estimate { display: flex; flex-direction: column; gap: 10px; }
 .cost-hint { margin-top: 8px; }

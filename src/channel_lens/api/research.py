@@ -20,7 +20,7 @@ from ..models import (
     VideoRevision,
     WatchlistEntry,
 )
-from ..services import ingest, outliers, thumbnails, titles, tracker
+from ..services import ingest, jobs, outliers, thumbnails, titles, tracker
 from ..services.ingest import estimate_channel_ingest_cost
 from ..youtube.client import (
     extract_video_id,
@@ -28,6 +28,7 @@ from ..youtube.client import (
     parse_channel_references,
 )
 from ..youtube.errors import (
+    NotConfigured,
     NotFound,
     OperationTooExpensive,
     QuotaExceeded,
@@ -275,24 +276,20 @@ def bulk_preview(
     }
 
 
-@router.post("/channels/bulk")
+@router.post("/channels/bulk", status_code=202)
 def bulk_add_channels(
     payload: BulkAddChannels, session: Session = Depends(get_db)
 ) -> dict[str, Any]:
-    """Import many channels, reporting each one's outcome separately.
+    """Start a bulk import in the background and return a job to poll.
 
-    Two rules make this survivable.
+    Returns immediately rather than holding the request open for the minutes a
+    large import takes. A browser given nothing to render for two minutes is
+    indistinguishable from a hung one, and the user has no way to tell whether
+    their click registered.
 
-    **One bad reference never stops the run.** A typo, a deleted channel, or a
-    vanity URL the API refuses to resolve is recorded against that row and the
-    loop continues. A batch that dies on item three, having already spent quota
-    on one and two, is the worst available outcome.
-
-    **Quota is re-checked before every channel, not once up front.** The
-    estimate is a forecast; real spend varies with how many uploads a channel
-    actually has and how much was already cached. When the budget runs out the
-    run stops cleanly and names the channels never attempted, rather than
-    failing them one by one against an exhausted API.
+    Validation and the quota cap are checked here, synchronously, so an import
+    that could never succeed is refused with a real error instead of failing
+    silently inside a background thread.
     """
     config = get_settings()
     references = parse_channel_references(payload.text)[:MAX_BULK_REFERENCES]
@@ -300,6 +297,8 @@ def bulk_add_channels(
         raise HTTPException(
             status_code=400, detail="No channel references found in that text."
         )
+    if not config.has_data_api:
+        raise NotConfigured()
 
     per_channel = estimate_channel_ingest_cost(payload.video_limit) + 1
     total_estimate = len(references) * per_channel
@@ -312,9 +311,52 @@ def bulk_add_channels(
             "in Settings.",
         )
 
-    job = JobRun(job="channel.bulk_add", status="running",
-                 detail=f"{len(references)} references")
-    session.add(job)
+    running = jobs.active("channel.bulk_add")
+    if running is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="An import is already running. Wait for it to finish, or cancel it.",
+        )
+
+    job = jobs.start(
+        "channel.bulk_add", len(references),
+        lambda job, job_session: _run_bulk_import(
+            job, job_session, references, payload, per_channel,
+        ),
+    )
+    return {
+        "job_id": job.id, "total": len(references),
+        "estimated_units": total_estimate,
+    }
+
+
+def _run_bulk_import(
+    job: jobs.Job, session: Session, references: list[str],
+    payload: BulkAddChannels, per_channel: int,
+) -> dict[str, Any]:
+    """Import each channel, reporting outcomes individually.
+
+    Three rules make this survivable.
+
+    **One bad reference never stops the run.** A typo, a deleted channel, or a
+    vanity URL the API refuses to resolve is recorded against that row and the
+    loop continues. A batch that dies on item three, having already spent quota
+    on one and two, is the worst available outcome.
+
+    **Quota is re-checked before every channel, not once up front.** The
+    estimate is a forecast; real spend varies with how many uploads a channel
+    actually has and how much was already cached. When the budget runs out the
+    run stops cleanly and names the channels never attempted, rather than
+    failing them one by one against an exhausted API.
+
+    **Cancellation is honoured between channels.** A long import that has begun
+    spending quota on the wrong list has to be stoppable, and stopping at a
+    channel boundary leaves no half-imported channel behind.
+    """
+    config = get_settings()
+    db_job = JobRun(job="channel.bulk_add", status="running",
+                    detail=f"{len(references)} references")
+    session.add(db_job)
     session.flush()
 
     client = youtube_client(session, config)
@@ -322,8 +364,21 @@ def bulk_add_channels(
     imported = failed = skipped = 0
     quota_ran_out = False
 
+    cancelled = False
     try:
         for reference in references:
+            job.current = reference
+
+            if cancelled or job.cancelled:
+                cancelled = True
+                results.append({
+                    "reference": reference, "status": "not_attempted",
+                    "message": "Cancelled before this one was reached.",
+                })
+                skipped += 1
+                job.advance()
+                continue
+
             if quota_ran_out or not ledger(config).can_afford(session, per_channel):
                 quota_ran_out = True
                 results.append({
@@ -331,6 +386,7 @@ def bulk_add_channels(
                     "message": "Stopped before this one — the daily quota ran out.",
                 })
                 skipped += 1
+                job.advance()
                 continue
 
             try:
@@ -342,11 +398,13 @@ def bulk_add_channels(
                 results.append({"reference": reference, "status": "not_attempted",
                                 "message": exc.message})
                 skipped += 1
+                job.advance()
                 continue
             except YouTubeError as exc:
                 results.append({"reference": reference, "status": "failed",
                                 "message": exc.message, "hint": exc.hint})
                 failed += 1
+                job.advance()
                 continue
 
             existing = session.get(Channel, raw["id"])
@@ -357,6 +415,7 @@ def bulk_add_channels(
                     "message": "Already tracked.",
                 })
                 skipped += 1
+                job.advance()
                 continue
 
             # Each channel writes inside its own SAVEPOINT. Catching the
@@ -418,30 +477,73 @@ def bulk_add_channels(
                     # now let it out rather than swallowing a shutdown.
                     raise
                 failed += 1
+            job.advance()
 
-        job.status = "error" if (failed and not imported) else "ok"
-        job.items_processed = imported
-        job.units_spent = client.units_spent
-        job.detail = (
+            # Commit after each channel so progress is durable and a later
+            # failure can't roll back work already reported as done.
+            session.commit()
+
+        db_job.status = "error" if (failed and not imported) else "ok"
+        db_job.items_processed = imported
+        db_job.units_spent = client.units_spent
+        db_job.detail = (
             f"Imported {imported}, skipped {skipped}, failed {failed} "
             f"of {len(references)}."
         )
         if failed:
-            job.error = "; ".join(
+            db_job.error = "; ".join(
                 f"{r['reference']}: {r.get('message', '')}"
                 for r in results if r["status"] == "failed"
             )[:2000]
-        job.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        db_job.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
         session.flush()
 
         return {
             "results": results, "imported": imported, "skipped": skipped,
             "failed": failed, "total": len(references),
             "units_spent": client.units_spent, "cache_hits": client.cache_hits,
-            "quota_ran_out": quota_ran_out,
+            "quota_ran_out": quota_ran_out, "cancelled": cancelled,
         }
     finally:
         client.close()
+
+
+@router.get("/jobs/live/{job_id}")
+def job_progress(job_id: str) -> dict[str, Any]:
+    """Poll a background job. Cheap enough to call once a second."""
+    job = jobs.get(job_id)
+    if job is None:
+        raise NotFound(
+            "That job is no longer available.",
+            "Finished jobs are kept for half an hour, and none survive a restart "
+            "of Channel Lens.",
+        )
+    return job.to_dict()
+
+
+@router.get("/jobs/live")
+def active_job(name: str | None = Query(None)) -> dict[str, Any]:
+    """The job currently running, if any.
+
+    Lets a page reopened mid-import re-attach to work already in flight rather
+    than showing no sign of it.
+    """
+    job = jobs.active(name)
+    return job.to_dict() if job else {"running": False}
+
+
+@router.post("/jobs/live/{job_id}/cancel")
+def cancel_job(job_id: str) -> dict[str, Any]:
+    """Ask a job to stop at its next clean boundary.
+
+    Cooperative rather than forced: the worker finishes the channel it is on,
+    so cancelling never leaves a half-imported channel behind.
+    """
+    job = jobs.get(job_id)
+    if job is None:
+        raise NotFound("That job is no longer available.")
+    job.cancel()
+    return {"ok": True, "message": "Stopping after the current channel."}
 
 
 @router.post("/channels/{channel_id}/refresh")
@@ -528,7 +630,11 @@ def list_outliers(
     channel_id: list[str] | None = Query(None),
     reliable_only: bool = Query(False),
     search: str | None = Query(None),
-    sort: Literal["multiplier", "views", "recent", "percentile"] = Query("multiplier"),
+    sort: Literal[
+        "multiplier", "views", "recent", "percentile", "baseline",
+        "title", "channel", "duration",
+    ] = Query("multiplier"),
+    direction: Literal["asc", "desc"] = Query("desc"),
     limit: int = Query(100, ge=1, le=500),
     session: Session = Depends(get_db),
 ) -> dict[str, Any]:
@@ -593,18 +699,34 @@ def list_outliers(
     if reliable_only:
         scores = [s for s in scores if s.reliable]
 
-    if sort == "views":
-        scores.sort(key=lambda s: s.views, reverse=True)
-    elif sort == "recent":
-        scores.sort(key=lambda s: s.published_at, reverse=True)
-    elif sort == "percentile":
-        scores.sort(key=lambda s: s.percentile, reverse=True)
+    # Sorting happens over the whole scored set before the limit is applied, so
+    # "sort by views ascending" means the lowest of everything that matched —
+    # not the lowest of whichever hundred happened to rank highest first.
+    sort_keys = {
+        "multiplier": lambda s: s.multiplier,
+        "views": lambda s: s.views,
+        "recent": lambda s: s.published_at,
+        "percentile": lambda s: s.percentile,
+        "baseline": lambda s: s.baseline_views,
+        "duration": lambda s: s.age_days,
+        "title": lambda s: (s.title or "").lower(),
+        "channel": lambda s: ((s.channel_title or "").lower(), -s.multiplier),
+    }
+    scores.sort(key=sort_keys[sort], reverse=(direction == "desc"))
 
     total = len(scores)
+    # Summary figures are computed over the whole matching set, never over the
+    # returned page. They are independent of both the sort column and the limit:
+    # "top multiplier" means the highest that matched, not whatever happens to
+    # be in row one after sorting by title.
     return {
         "results": [s.to_dict() for s in scores[:limit]],
         "total": total,
         "shown": min(total, limit),
+        "outlier_count": sum(1 for s in scores if s.is_outlier),
+        "max_multiplier": round(max((s.multiplier for s in scores), default=0.0), 2),
+        "unreliable_count": sum(1 for s in scores if not s.reliable),
+        "channels_matched": len({s.channel_id for s in scores}),
         "baselines": {k: b.to_dict() for k, b in baselines.items()},
         "threshold": config.outlier_threshold,
     }

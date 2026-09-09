@@ -24,6 +24,7 @@ const filters = {
   reliable_only: false,
   search: '',
   sort: 'multiplier',
+  direction: 'desc',
   limit: 100,
 };
 
@@ -44,6 +45,9 @@ export async function render(view) {
 
   view.append(filterBar(() => load()));
   view.append(results);
+
+  // Column headers re-sort through the same load path as every other filter.
+  onSortChange = load;
 
   async function load() {
     const first = !results.dataset.loaded;
@@ -105,12 +109,8 @@ function filterBar(onChange) {
       el('option', { value: v, selected: String(filters.min_views) === v, text: label })));
   views.onchange = () => { filters.min_views = views.value; onChange(); };
 
-  const sort = el('select', {},
-    [['multiplier', 'Multiplier'], ['views', 'Views'],
-     ['recent', 'Newest'], ['percentile', 'Percentile']].map(([v, label]) =>
-      el('option', { value: v, selected: filters.sort === v, text: label })));
-  sort.onchange = () => { filters.sort = sort.value; onChange(); };
-
+  // No sort control here: the column headers are the sort control, and two
+  // competing ones would disagree the moment either was used.
   const reliable = el('input', { type: 'checkbox', checked: filters.reliable_only });
   reliable.onchange = () => { filters.reliable_only = reliable.checked; onChange(); };
 
@@ -120,7 +120,6 @@ function filterBar(onChange) {
     fieldOf('Format', format),
     fieldOf('Published', age),
     fieldOf('Min views', views),
-    fieldOf('Sort by', sort),
     el('div', { class: 'field' }, el('label', { text: 'Confidence' }),
       el('label', { class: 'switch', title: 'Hide videos whose baseline is too small to trust' },
         reliable, el('span', { class: 'track' }), el('span', { class: 'small', text: 'Reliable only' }))),
@@ -188,14 +187,15 @@ function renderResults(data) {
 
   const nodes = [];
 
-  const strong = data.results.filter((r) => r.is_outlier).length;
-  const unreliable = data.results.filter((r) => !r.reliable).length;
+  // These come from the server, computed over every matching video — not from
+  // `results`, which is one sorted, truncated page of them.
+  const unreliable = data.unreliable_count;
 
   nodes.push(el('div', { class: 'grid cols-4' },
     stat('Matching videos', full(data.total)),
-    stat(`At or above ${data.threshold}×`, full(strong)),
-    stat('Top multiplier', `${data.results[0].multiplier.toFixed(1)}×`),
-    stat('Channels compared', full(new Set(data.results.map((r) => r.channel_id)).size))));
+    stat(`At or above ${data.threshold}×`, full(data.outlier_count)),
+    stat('Top multiplier', `${(data.max_multiplier || 0).toFixed(1)}×`),
+    stat('Channels compared', full(data.channels_matched))));
 
   if (unreliable) {
     nodes.push(notice('warning', `${unreliable} of these rest on a thin baseline`,
@@ -220,20 +220,66 @@ function renderResults(data) {
   nodes.push(el('div', { class: 'card' },
     el('div', { class: 'card-head' },
       el('div', {}, el('h2', { text: 'Ranked results' }),
-        el('div', { class: 'sub', text: `Showing ${data.shown} of ${data.total}` }))),
+        el('div', { class: 'sub', text:
+          `Showing ${data.shown} of ${data.total} · sorted by ${SORT_LABELS[filters.sort]} ` +
+          `${filters.direction === 'desc' ? 'high to low' : 'low to high'}` }))),
     el('div', { class: 'table-wrap' },
       el('table', {},
         el('thead', {}, el('tr', {},
-          el('th', { text: 'Video' }),
-          el('th', { class: 'num', text: 'vs normal' }),
-          el('th', { class: 'num', text: 'Views' }),
-          el('th', { class: 'num', text: 'Channel median' }),
-          el('th', { class: 'num', text: 'Percentile' }),
-          el('th', { text: 'Published' }),
+          sortableHeader('Video', 'title'),
+          sortableHeader('vs normal', 'multiplier', true),
+          sortableHeader('Views', 'views', true),
+          sortableHeader('Channel median', 'baseline', true),
+          sortableHeader('Percentile', 'percentile', true),
+          sortableHeader('Published', 'recent'),
           el('th', { text: '' }))),
         el('tbody', {}, rows)))));
 
   return nodes;
+}
+
+const SORT_LABELS = {
+  multiplier: 'multiplier', views: 'views', recent: 'publish date',
+  percentile: 'percentile', baseline: 'channel median', title: 'title',
+  channel: 'channel', duration: 'age',
+};
+
+/* Text columns read naturally A→Z; numbers and dates are almost always wanted
+ * biggest-first, so each column opens in the direction you'd actually want. */
+const DEFAULT_DIRECTION = {
+  title: 'asc', channel: 'asc',
+  multiplier: 'desc', views: 'desc', baseline: 'desc',
+  percentile: 'desc', recent: 'desc', duration: 'desc',
+};
+
+let onSortChange = () => {};
+
+function sortableHeader(label, key, numeric = false) {
+  const active = filters.sort === key;
+  const arrow = !active ? '' : filters.direction === 'desc' ? '↓' : '↑';
+
+  const th = el('th', {
+    class: `sortable ${numeric ? 'num' : ''} ${active ? 'active' : ''}`,
+    scope: 'col',
+    title: active
+      ? `Sorted by ${label.toLowerCase()} — click to reverse`
+      : `Sort by ${label.toLowerCase()}`,
+    'aria-sort': active ? (filters.direction === 'desc' ? 'descending' : 'ascending') : 'none',
+  },
+    el('button', { class: 'sort-btn', type: 'button' },
+      el('span', { text: label }),
+      el('span', { class: 'sort-arrow', text: arrow || '↕' })));
+
+  th.querySelector('button').onclick = () => {
+    if (filters.sort === key) {
+      filters.direction = filters.direction === 'desc' ? 'asc' : 'desc';
+    } else {
+      filters.sort = key;
+      filters.direction = DEFAULT_DIRECTION[key] || 'desc';
+    }
+    onSortChange();
+  };
+  return th;
 }
 
 function stat(label, value, note) {

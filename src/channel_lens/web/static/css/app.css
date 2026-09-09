@@ -426,6 +426,24 @@ thead th {
   color: var(--ink-muted); border-bottom: 1px solid var(--border);
   background: var(--surface); position: sticky; top: 0; z-index: 1;
 }
+/* Sortable column headers. The arrow is always present — a faint ↕ on
+ * inactive columns — so the whole row reads as clickable rather than only
+ * revealing itself on hover. */
+th.sortable { padding: 0; }
+th.sortable .sort-btn {
+  display: flex; align-items: center; gap: 5px; width: 100%;
+  padding: 9px 12px; background: none; border: none; cursor: pointer;
+  font: inherit; color: inherit; text-transform: inherit;
+  letter-spacing: inherit; text-align: left;
+  transition: color .12s var(--ease), background .12s var(--ease);
+}
+th.sortable.num .sort-btn { justify-content: flex-end; }
+th.sortable .sort-btn:hover { color: var(--ink); background: var(--surface-2); }
+th.sortable.active .sort-btn { color: var(--accent); }
+.sort-arrow { font-size: .85em; opacity: .35; line-height: 1; }
+th.sortable.active .sort-arrow { opacity: 1; }
+th.sortable .sort-btn:hover .sort-arrow { opacity: .8; }
+
 tbody td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
 tbody tr:last-child td { border-bottom: none; }
 tbody tr { transition: background .12s var(--ease); }

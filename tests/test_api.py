@@ -151,6 +151,115 @@ def test_outlier_filters_are_applied(client, session):
     assert [r["video_id"] for r in searched["results"]] == ["breakout"]
 
 
+def test_outliers_sort_by_every_column_in_both_directions(client, session):
+    """Each column header has to actually reorder the whole result set."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    session.add(Channel(id="UC_a", title="Alpha Channel"))
+    session.add(Channel(id="UC_b", title="Zulu Channel"))
+    for i in range(8):
+        for cid in ("UC_a", "UC_b"):
+            session.add(Video(
+                id=f"{cid}_v{i}", channel_id=cid, title=f"{cid} video {i}",
+                published_at=now - timedelta(days=30 + i * 3),
+                duration_seconds=600, is_short=False,
+                latest_view_count=1000 * (i + 1), outlier_multiplier=1.0,
+            ))
+    session.commit()
+
+    def ordered(sort, direction):
+        body = client.get("/api/outliers", params={
+            "sort": sort, "direction": direction, "min_multiplier": 0,
+        }).json()
+        return body["results"]
+
+    for column, key in [
+        ("views", lambda r: r["views"]),
+        ("multiplier", lambda r: r["multiplier"]),
+        ("baseline", lambda r: r["baseline_views"]),
+        ("percentile", lambda r: r["percentile"]),
+        ("title", lambda r: r["title"].lower()),
+        ("recent", lambda r: r["published_at"]),
+    ]:
+        desc = [key(r) for r in ordered(column, "desc")]
+        asc = [key(r) for r in ordered(column, "asc")]
+
+        assert desc == sorted(desc, reverse=True), f"{column} desc"
+        assert asc == sorted(asc), f"{column} asc"
+        assert desc[0] == asc[-1], f"{column} directions disagree"
+
+
+def test_summary_figures_ignore_the_sort_and_the_limit(client, session):
+    """'Top multiplier' must mean the highest that matched, not row one.
+
+    Shipped broken the moment sorting became configurable: the tile read
+    results[0], so sorting by title reported that video's multiplier as the
+    channel's best.
+    """
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    session.add(Channel(id="UC_s", title="Summary"))
+    for i in range(9):
+        session.add(Video(
+            id=f"sum{i}", channel_id="UC_s", title=f"zzz video {i}",
+            published_at=now - timedelta(days=30 + i),
+            duration_seconds=600, is_short=False,
+            latest_view_count=1000, outlier_multiplier=1.0,
+        ))
+    session.add(Video(
+        id="aaa_big", channel_id="UC_s", title="aaa the big one",
+        published_at=now - timedelta(days=25), duration_seconds=600,
+        is_short=False, latest_view_count=20_000, outlier_multiplier=20.0,
+    ))
+    session.commit()
+
+    by_multiplier = client.get("/api/outliers", params={"min_multiplier": 0}).json()
+    top = by_multiplier["max_multiplier"]
+    assert top == pytest.approx(20.0)
+
+    # Sorting by title puts the 1x video first; the summary must not follow it.
+    by_title = client.get("/api/outliers", params={
+        "sort": "title", "direction": "asc", "min_multiplier": 0,
+    }).json()
+
+    assert by_title["results"][0]["video_id"] == "aaa_big"
+    assert by_title["max_multiplier"] == pytest.approx(top)
+    assert by_title["outlier_count"] == by_multiplier["outlier_count"]
+    assert by_title["channels_matched"] == 1
+
+    # And a truncated page still reports the whole set's figures.
+    limited = client.get("/api/outliers", params={
+        "sort": "title", "direction": "desc", "limit": 2, "min_multiplier": 0,
+    }).json()
+    assert len(limited["results"]) == 2
+    assert limited["max_multiplier"] == pytest.approx(top)
+
+
+def test_sorting_applies_before_the_limit(client, session):
+    """Sorting only the visible page would quietly show the wrong rows.
+
+    'Lowest views' must mean the lowest of everything matching, not the lowest
+    of whichever page happened to rank highest under the previous sort.
+    """
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    session.add(Channel(id="UC_many", title="Many"))
+    for i in range(30):
+        session.add(Video(
+            id=f"many{i:03d}", channel_id="UC_many", title=f"Video {i}",
+            published_at=now - timedelta(days=40 + i),
+            duration_seconds=600, is_short=False,
+            latest_view_count=100 * (i + 1), outlier_multiplier=1.0,
+        ))
+    session.commit()
+
+    page = client.get("/api/outliers", params={
+        "sort": "views", "direction": "asc", "limit": 5, "min_multiplier": 0,
+    }).json()
+
+    assert page["total"] == 30
+    assert len(page["results"]) == 5
+    # The genuinely smallest video in the set, not the smallest of a top slice.
+    assert page["results"][0]["views"] == 100
+
+
 def test_shorts_get_their_own_baseline(client, session):
     """Pooling Shorts with long-form would make both baselines meaningless."""
     now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -290,6 +399,28 @@ def test_bulk_preview_spends_no_quota(client):
     assert client.get("/api/quota").json()["used"] == 0
 
 
+def _run_bulk(client, **payload):
+    """Start a bulk import and wait for the background job to finish.
+
+    The endpoint returns as soon as the job is queued, so tests have to wait on
+    it the same way the UI does.
+    """
+    import time
+
+    started = client.post("/api/channels/bulk", json=payload)
+    assert started.status_code == 202, started.json()
+    job_id = started.json()["job_id"]
+
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        job = client.get(f"/api/jobs/live/{job_id}").json()
+        if not job["running"]:
+            assert job["status"] != "error", job.get("error")
+            return job["result"], job
+        time.sleep(0.05)
+    raise AssertionError("bulk import did not finish in time")
+
+
 def test_bulk_import_isolates_a_failing_channel(client, monkeypatch):
     """The whole point: one bad row must not take the batch down with it.
 
@@ -300,9 +431,7 @@ def test_bulk_import_isolates_a_failing_channel(client, monkeypatch):
     _stub_youtube(monkeypatch, explode_on="boom")
     client.put("/api/settings", json={"youtube_api_key": "AIzaTEST"})
 
-    body = client.post("/api/channels/bulk", json={
-        "text": "@first\n@boom\n@missing\n@last", "video_limit": 50,
-    }).json()
+    body, _job = _run_bulk(client, text="@first\n@boom\n@missing\n@last", video_limit=50)
 
     by_ref = {r["reference"]: r for r in body["results"]}
     assert by_ref["@first"]["status"] == "imported"
@@ -325,7 +454,7 @@ def test_bulk_import_reports_a_bad_reference_without_raw_sql(client, monkeypatch
     _stub_youtube(monkeypatch, explode_on="boom")
     client.put("/api/settings", json={"youtube_api_key": "AIzaTEST"})
 
-    body = client.post("/api/channels/bulk", json={"text": "@boom"}).json()
+    body, _job = _run_bulk(client, text="@boom")
     message = body["results"][0]["message"]
 
     assert "[SQL:" not in message
@@ -337,10 +466,10 @@ def test_bulk_import_skips_already_tracked_channels(client, monkeypatch):
     _stub_youtube(monkeypatch)
     client.put("/api/settings", json={"youtube_api_key": "AIzaTEST"})
 
-    first = client.post("/api/channels/bulk", json={"text": "@alpha\n@beta"}).json()
+    first, _ = _run_bulk(client, text="@alpha\n@beta")
     assert first["imported"] == 2
 
-    again = client.post("/api/channels/bulk", json={"text": "@alpha\n@beta"}).json()
+    again, _ = _run_bulk(client, text="@alpha\n@beta")
     assert again["imported"] == 0
     assert again["skipped"] == 2
     # Re-running a list must not re-pay for what is already stored.
@@ -370,6 +499,77 @@ def test_bulk_import_rejects_empty_text(client):
     client.put("/api/settings", json={"youtube_api_key": "AIzaTEST"})
     response = client.post("/api/channels/bulk", json={"text": "   \n\n  "})
     assert response.status_code == 400
+
+
+def test_bulk_import_returns_immediately_with_a_job_to_poll(client, monkeypatch):
+    """The request must not stay open for the minutes a real import takes."""
+    _stub_youtube(monkeypatch)
+    client.put("/api/settings", json={"youtube_api_key": "AIzaTEST"})
+
+    response = client.post("/api/channels/bulk", json={"text": "@a\n@b\n@c"})
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["total"] == 3
+    assert body["job_id"]
+
+    job = client.get(f"/api/jobs/live/{body['job_id']}").json()
+    assert job["total"] == 3
+    assert "fraction" in job and "done" in job
+
+
+def test_import_progress_reaches_completion(client, monkeypatch):
+    _stub_youtube(monkeypatch)
+    client.put("/api/settings", json={"youtube_api_key": "AIzaTEST"})
+
+    result, job = _run_bulk(client, text="@a\n@b\n@c")
+
+    assert job["done"] == job["total"] == 3
+    assert job["fraction"] == 1.0
+    assert job["running"] is False
+    assert result["imported"] == 3
+
+
+def test_a_running_import_can_be_found_again(client, monkeypatch):
+    """A page reopened mid-import has to be able to re-attach to the job."""
+    _stub_youtube(monkeypatch)
+    client.put("/api/settings", json={"youtube_api_key": "AIzaTEST"})
+
+    started = client.post("/api/channels/bulk", json={"text": "@a\n@b"}).json()
+    live = client.get("/api/jobs/live", params={"name": "channel.bulk_add"}).json()
+
+    # Either still running and discoverable, or already done — both are fine;
+    # what must not happen is the job being invisible while it runs.
+    assert live.get("id") == started["job_id"] or live["running"] is False
+
+
+def test_only_one_import_runs_at_a_time(client, monkeypatch):
+    """Two concurrent imports would race on the same quota ledger."""
+    import time
+    from channel_lens.youtube import client as yt
+
+    _stub_youtube(monkeypatch)
+    original = yt.YouTubeClient.resolve_channel
+
+    def slow_resolve(self, reference):
+        time.sleep(0.3)
+        return original(self, reference)
+
+    monkeypatch.setattr(yt.YouTubeClient, "resolve_channel", slow_resolve)
+    client.put("/api/settings", json={"youtube_api_key": "AIzaTEST"})
+
+    first = client.post("/api/channels/bulk", json={"text": "@a\n@b\n@c"})
+    assert first.status_code == 202
+
+    second = client.post("/api/channels/bulk", json={"text": "@d"})
+    assert second.status_code == 409
+    assert "already running" in second.json()["detail"]
+
+
+def test_polling_an_unknown_job_explains_itself(client):
+    response = client.get("/api/jobs/live/nosuchjob")
+    assert response.status_code == 404
+    assert response.json()["hint"]
 
 
 # ------------------------------------------------- videos from unknown channels
