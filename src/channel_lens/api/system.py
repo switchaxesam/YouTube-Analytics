@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from ..config import SECRET_KEYS, Settings, get_settings
 from ..models import JobRun
+from ..services import exclusions
 from ..youtube import analytics
 from ..youtube.client import YouTubeClient
 from ..youtube.errors import YouTubeError
@@ -51,6 +52,18 @@ class SettingsUpdate(BaseModel):
     anthropic_effort: str | None = None
     shorts_max_seconds: int | None = None
     theme: str | None = None
+    # Exclusions. List fields replace wholesale rather than merging, so the
+    # UI can remove an entry by sending the shorter list.
+    excluded_keywords: list[str] | None = None
+    excluded_category_ids: list[str] | None = None
+    excluded_languages: list[str] | None = None
+    only_languages: list[str] | None = None
+    excluded_channel_ids: list[str] | None = None
+    min_duration_seconds: int | None = None
+    max_duration_seconds: int | None = None
+    min_channel_subscribers: int | None = None
+    max_channel_subscribers: int | None = None
+    exclude_live: bool | None = None
     clear_secrets: list[str] = []
 
 
@@ -148,6 +161,21 @@ def test_anthropic_key() -> dict[str, Any]:
         return {"ok": False, "message": f"The key was not accepted: {exc}"}
 
     return {"ok": True, "message": f"Key works with {config.anthropic_model}."}
+
+
+@router.get("/exclusions/categories")
+def exclusion_categories() -> list[dict[str, str]]:
+    """YouTube's categories, for the exclusion picker.
+
+    Excluding a whole category is the strongest filter available: it catches
+    content nobody thought to write a keyword for.
+    """
+    return [
+        {"id": cid, "name": name}
+        for cid, name in sorted(
+            exclusions.CATEGORY_NAMES.items(), key=lambda kv: kv[1]
+        )
+    ]
 
 
 @router.get("/quota")

@@ -21,7 +21,15 @@ from ..models import (
     VideoRevision,
     WatchlistEntry,
 )
-from ..services import ingest, jobs, outliers, thumbnails, titles, tracker
+from ..services import (
+    exclusions,
+    ingest,
+    jobs,
+    outliers,
+    thumbnails,
+    titles,
+    tracker,
+)
 from ..services.ingest import estimate_channel_ingest_cost
 from ..youtube.client import (
     extract_video_id,
@@ -630,6 +638,8 @@ def list_outliers(
     min_views: int = Query(0, ge=0),
     channel_id: list[str] | None = Query(None),
     reliable_only: bool = Query(False),
+    #: Bypass the standing exclusions, so the user can always see what was hidden.
+    include_excluded: bool = Query(False),
     search: str | None = Query(None),
     sort: Literal[
         "multiplier", "views", "recent", "percentile", "baseline",
@@ -670,12 +680,27 @@ def list_outliers(
 
     videos = list(session.scalars(query).all())
     if not videos:
-        return {"results": [], "total": 0, "baselines": {}}
+        return {"results": [], "total": 0, "baselines": {}, "excluded": 0, "exclusions": []}
 
     channel_ids = {v.channel_id for v in videos}
     channels = {
         c.id: c for c in session.scalars(select(Channel).where(Channel.id.in_(channel_ids))).all()
     }
+
+    # Exclusions are applied to the *scored* set, never to the baselines below:
+    # a channel's normal is what it normally does, including the videos you
+    # personally don't care about. Filtering those out of the denominator would
+    # silently inflate every multiplier that survived.
+    rules = exclusions.from_settings(config)
+    dropped: list[dict[str, Any]] = []
+    if rules.active and not include_excluded:
+        videos, dropped = exclusions.partition(videos, rules, channels)
+        if not videos:
+            return {
+                "results": [], "total": 0, "baselines": {},
+                "excluded": len(dropped), "exclusions": dropped[:50],
+                "threshold": config.outlier_threshold,
+            }
 
     # Rebuild baselines from the full stored history per channel, not just the
     # filtered subset — filtering to "last 30 days" must not redefine normal.
@@ -730,6 +755,10 @@ def list_outliers(
         "channels_matched": len({s.channel_id for s in scores}),
         "baselines": {k: b.to_dict() for k, b in baselines.items()},
         "threshold": config.outlier_threshold,
+        # Always reported, so a hidden result is never a mystery.
+        "excluded": len(dropped),
+        "exclusions": dropped[:50],
+        "exclusions_active": rules.active,
     }
 
 
@@ -1203,6 +1232,14 @@ def discover(payload: DiscoverQuery, session: Session = Depends(get_db)) -> dict
                 if baseline:
                     baselines[f"{cid}:{'short' if is_short else 'long'}"] = baseline
 
+        # Applied after ingestion, deliberately. The videos were already paid
+        # for by the search, and storing them means a later change of mind
+        # about the exclusions costs nothing to act on.
+        rules = exclusions.from_settings(config)
+        dropped: list[dict[str, Any]] = []
+        if rules.active:
+            videos, dropped = exclusions.partition(videos, rules, channels)
+
         scores = outliers.score_videos(
             videos, baselines, {cid: c.title for cid, c in channels.items()},
             outlier_threshold=config.outlier_threshold,
@@ -1231,6 +1268,9 @@ def discover(payload: DiscoverQuery, session: Session = Depends(get_db)) -> dict
             ),
             "units_spent": client.units_spent,
             "cache_hits": client.cache_hits,
+            "excluded": len(dropped),
+            "exclusions": dropped[:50],
+            "exclusions_active": rules.active,
         }
     finally:
         client.close()

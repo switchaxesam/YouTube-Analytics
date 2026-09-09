@@ -133,7 +133,13 @@ def test_data_endpoints_report_missing_key_actionably(client):
 def test_outliers_returns_empty_rather_than_erroring(client):
     response = client.get("/api/outliers")
     assert response.status_code == 200
-    assert response.json() == {"results": [], "total": 0, "baselines": {}}
+
+    body = response.json()
+    assert body["results"] == []
+    assert body["total"] == 0
+    assert body["baselines"] == {}
+    # The exclusion count is always reported, even when nothing matched.
+    assert body["excluded"] == 0
 
 
 def test_outlier_filters_are_applied(client, session):
@@ -604,6 +610,145 @@ def test_polling_an_unknown_job_explains_itself(client):
     response = client.get("/api/jobs/live/nosuchjob")
     assert response.status_code == 404
     assert response.json()["hint"]
+
+
+# ------------------------------------------------------------- exclusions
+
+
+def _niche_videos(session):
+    """A channel mixing the user's niche with content they don't make."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    session.add(Channel(id="UC_mix", title="Mixed Channel", subscriber_count=50_000))
+
+    def add(vid, title, **kwargs):
+        session.add(Video(
+            id=vid, channel_id="UC_mix", title=title,
+            published_at=now - timedelta(days=kwargs.pop("age", 30)),
+            duration_seconds=kwargs.pop("duration", 600), is_short=False,
+            latest_view_count=kwargs.pop("views", 1000),
+            outlier_multiplier=1.0, **kwargs,
+        ))
+
+    for i in range(8):
+        add(f"wood{i}", f"Building a workbench part {i}", age=40 + i)
+    add("game1", "Minecraft base tour", category_id="20", views=9000)
+    add("game2", "Best gameplay moments", views=9000)
+    add("jpn1", "木工の基本", default_language="ja", views=9000)
+    add("live1", "Live from the workshop", is_live=True, views=9000)
+    add("long1", "Four hour build stream", duration=14_400, views=9000)
+    session.commit()
+
+
+def test_only_live_content_is_excluded_by_default(client, session):
+    """A fresh install filters nothing but live VODs, and says so."""
+    _niche_videos(session)
+    body = client.get("/api/outliers", params={"min_multiplier": 0}).json()
+
+    titles = {r["title"] for r in body["results"]}
+    assert "Minecraft base tour" in titles       # nothing topical is assumed
+    assert "Live from the workshop" not in titles
+    assert body["excluded"] == 1
+    assert body["exclusions"][0]["reason"] == "live broadcast"
+
+
+def test_live_exclusion_can_be_turned_off(client, session):
+    _niche_videos(session)
+    client.put("/api/settings", json={"exclude_live": False})
+
+    body = client.get("/api/outliers", params={"min_multiplier": 0}).json()
+    assert body["excluded"] == 0
+    assert body["exclusions_active"] is False
+
+
+def test_category_exclusion_beats_keywords(client, session):
+    """Excluding Gaming catches games content however it is titled."""
+    _niche_videos(session)
+    client.put("/api/settings", json={"excluded_category_ids": ["20"]})
+
+    body = client.get("/api/outliers", params={"min_multiplier": 0}).json()
+    titles = {r["title"] for r in body["results"]}
+
+    assert "Minecraft base tour" not in titles
+    reasons = {x["video_id"]: x["reason"] for x in body["exclusions"]}
+    assert reasons["game1"] == "category is Gaming"
+
+
+def test_keyword_exclusion_matches_whole_words(client, session):
+    _niche_videos(session)
+    client.put("/api/settings", json={"excluded_keywords": ["gameplay", "minecraft"]})
+
+    body = client.get("/api/outliers", params={"min_multiplier": 0}).json()
+    titles = {r["title"] for r in body["results"]}
+
+    assert "Minecraft base tour" not in titles
+    assert "Best gameplay moments" not in titles
+    assert any("workbench" in t for t in titles)
+
+
+def test_language_live_and_duration_exclusions(client, session):
+    _niche_videos(session)
+    client.put("/api/settings", json={
+        "only_languages": ["en"],
+        "exclude_live": True,
+        "max_duration_seconds": 3600,
+    })
+
+    body = client.get("/api/outliers", params={"min_multiplier": 0}).json()
+    reasons = {x["video_id"]: x["reason"] for x in body["exclusions"]}
+
+    assert "jpn1" in reasons and "not one you cover" in reasons["jpn1"]
+    assert "live1" in reasons and reasons["live1"] == "live broadcast"
+    assert "long1" in reasons and "longer than 60 min" in reasons["long1"]
+
+
+def test_exclusions_do_not_change_the_baseline(client, session):
+    """A channel's normal is what it normally does — including what you skip.
+
+    Removing excluded videos from the denominator would silently inflate the
+    multiplier of everything that survived, which is a far worse error than
+    showing an irrelevant video.
+    """
+    _niche_videos(session)
+
+    before = client.get("/api/outliers", params={"min_multiplier": 0}).json()
+    baseline_before = before["baselines"]["UC_mix:long"]["median_views"]
+
+    client.put("/api/settings", json={"excluded_keywords": ["minecraft", "gameplay"]})
+    after = client.get("/api/outliers", params={"min_multiplier": 0}).json()
+
+    assert {x["video_id"] for x in after["exclusions"]} >= {"game1", "game2"}
+    assert after["baselines"]["UC_mix:long"]["median_views"] == baseline_before
+
+    # And a video kept by both queries scores identically.
+    pick = lambda body, vid: next(r for r in body["results"] if r["video_id"] == vid)
+    assert pick(after, "wood0")["multiplier"] == pick(before, "wood0")["multiplier"]
+
+
+def test_excluded_videos_can_always_be_revealed(client, session):
+    """A hidden result must never be a mystery."""
+    _niche_videos(session)
+    client.put("/api/settings", json={"excluded_keywords": ["minecraft"]})
+
+    hidden = client.get("/api/outliers", params={"min_multiplier": 0}).json()
+    reasons = {x["video_id"]: x["reason"] for x in hidden["exclusions"]}
+    # The reason travels with it, not just the count.
+    assert reasons["game1"] == "matched “minecraft”"
+
+    shown = client.get("/api/outliers", params={
+        "min_multiplier": 0, "include_excluded": True,
+    }).json()
+    assert "Minecraft base tour" in {r["title"] for r in shown["results"]}
+    assert shown["excluded"] == 0
+
+
+def test_channel_size_bounds_exclude_out_of_range_channels(client, session):
+    _niche_videos(session)
+    client.put("/api/settings", json={"max_channel_subscribers": 10_000})
+
+    body = client.get("/api/outliers", params={"min_multiplier": 0}).json()
+    assert body["results"] == []
+    assert body["excluded"] > 0
+    assert "bigger than your range" in body["exclusions"][0]["reason"]
 
 
 # --------------------------------------------------- cached thumbnail images

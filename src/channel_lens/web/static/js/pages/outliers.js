@@ -12,7 +12,7 @@ import { api } from '../api.js';
 import { state, refreshChannels } from '../app.js';
 import {
   el, clear, compact, full, ago, empty, notice, loading, toastError,
-  multiplierBadge, videoCell, debounce, badge, withBusy, modal,
+  multiplierBadge, videoCell, debounce, badge, withBusy, modal, ICON,
 } from '../ui.js';
 
 const filters = {
@@ -25,6 +25,7 @@ const filters = {
   search: '',
   sort: 'multiplier',
   direction: 'desc',
+  include_excluded: false,
   limit: 100,
 };
 
@@ -59,6 +60,7 @@ export async function render(view) {
         ...filters,
         channel_id: filters.channel_id.length ? filters.channel_id : undefined,
         reliable_only: filters.reliable_only || undefined,
+        include_excluded: filters.include_excluded || undefined,
         max_age_days: filters.max_age_days || undefined,
         min_views: filters.min_views || undefined,
         search: filters.search || undefined,
@@ -204,6 +206,10 @@ function renderResults(data) {
       'finding as a 12× against forty.'));
   }
 
+  // Never hide silently. A result missing for a reason the user can't see is
+  // indistinguishable from a bug.
+  if (data.excluded) nodes.push(exclusionNotice(data));
+
   const rows = data.results.map((r) => el('tr', {},
     el('td', {}, videoCell(r)),
     el('td', { class: 'num' }, multiplierBadge(r.multiplier, data.threshold)),
@@ -287,6 +293,40 @@ function stat(label, value, note) {
     el('div', { class: 'stat-label', text: label }),
     el('div', { class: 'stat-value', text: value }),
     note ? el('div', { class: 'stat-note', text: note }) : null);
+}
+
+/** Report what the standing exclusions removed, and offer to show it. */
+function exclusionNotice(data) {
+  const showBtn = el('button', { class: 'btn ghost sm', text: 'Show what was hidden' });
+  showBtn.onclick = () => modal({
+    title: `${data.excluded} hidden by your exclusions`,
+    subtitle: 'Each one names the rule that removed it. Adjust these in Settings → Exclusions.',
+    body: el('div', { class: 'ref-list' },
+      data.exclusions.map((x) => el('div', { class: 'ref-row' },
+        el('span', { class: 'ref-name truncate', text: x.title || x.video_id }),
+        el('span', { class: 'small muted nowrap', text: x.reason })))),
+    actions: [
+      { label: 'Open exclusions', onClick: () => { window.location.hash = '#/settings'; } },
+      { label: 'Close', variant: 'primary' },
+    ],
+  });
+
+  const includeBtn = el('button', { class: 'btn ghost sm',
+    text: filters.include_excluded ? 'Re-apply exclusions' : 'Include them anyway' });
+  includeBtn.onclick = () => {
+    filters.include_excluded = !filters.include_excluded;
+    onSortChange();
+  };
+
+  return el('div', { class: 'notice info' },
+    el('div', { class: 'icon', html: ICON.info }),
+    el('div', { style: { flex: '1' } },
+      el('strong', { text: `${data.excluded} video${data.excluded === 1 ? '' : 's'} hidden by your exclusions` }),
+      el('p', { text:
+        'Filtered out as outside your niche. They are excluded from the ranking but not ' +
+        'from any channel’s baseline — a channel’s normal is what it normally does, ' +
+        'including the videos you don’t care about.' }),
+      el('div', { class: 'row mt-sm' }, showBtn, includeBtn)));
 }
 
 function detailButton(row) {

@@ -11,7 +11,9 @@
 
 import { api } from '../api.js';
 import { applyTheme, refreshStatus, state } from '../app.js';
-import { el, toast, toastError, notice, withBusy, modal, badge, ICON } from '../ui.js';
+import {
+  el, clear as clearNode, toast, toastError, notice, withBusy, modal, badge, ICON,
+} from '../ui.js';
 
 export async function render(view) {
   const status = state.status || await refreshStatus();
@@ -49,6 +51,7 @@ export async function render(view) {
 
   page.append(credentialsCard(settings));
   page.append(identityCard(settings));
+  page.append(await exclusionsCard(settings));
   page.append(analysisCard(settings));
   page.append(scoringCard(settings));
   page.append(trackerCard(settings));
@@ -284,6 +287,163 @@ function clearBtn(key) {
     ],
   });
   return btn;
+}
+
+/* ------------------------------------------------------------ exclusions */
+
+/** What isn't your niche.
+ *
+ * Ordered by how much work each does. Categories and language hold for content
+ * you have never seen; keywords only catch what you thought to type, so they
+ * come last despite being the obvious first idea.
+ */
+async function exclusionsCard(settings) {
+  let categories = [];
+  try {
+    categories = await api.get('/api/exclusions/categories');
+  } catch { /* the picker degrades to nothing rather than breaking Settings */ }
+
+  const state = {
+    excluded_category_ids: [...(settings.excluded_category_ids || [])],
+    excluded_keywords: [...(settings.excluded_keywords || [])],
+    excluded_languages: [...(settings.excluded_languages || [])],
+    only_languages: [...(settings.only_languages || [])],
+  };
+
+  const save = async (patch) => {
+    try { await api.put('/api/settings', patch); }
+    catch (err) { toastError(err, 'Could not save'); }
+  };
+
+  /* --- categories: chips, because there are few enough to show them all --- */
+  const categoryChips = el('div', { class: 'chips' },
+    categories.map((c) => {
+      const chip = el('button', {
+        class: `chip ${state.excluded_category_ids.includes(c.id) ? 'on' : ''}`,
+        text: c.name,
+      });
+      chip.onclick = async () => {
+        const i = state.excluded_category_ids.indexOf(c.id);
+        if (i >= 0) state.excluded_category_ids.splice(i, 1);
+        else state.excluded_category_ids.push(c.id);
+        chip.classList.toggle('on');
+        await save({ excluded_category_ids: state.excluded_category_ids });
+      };
+      return chip;
+    }));
+
+  /* --- keywords: a removable tag list --- */
+  const keywordList = el('div', { class: 'chips' });
+  const keywordInput = el('input', {
+    type: 'text', placeholder: 'minecraft, let’s play, fortnite*  —  Enter to add',
+  });
+
+  function paintKeywords() {
+    clearNode(keywordList);
+    if (!state.excluded_keywords.length) {
+      keywordList.append(el('span', { class: 'small muted', text: 'No keywords excluded.' }));
+      return;
+    }
+    for (const word of state.excluded_keywords) {
+      const chip = el('span', { class: 'chip on' }, word,
+        el('span', { class: 'x', title: 'Remove' }, '×'));
+      chip.querySelector('.x').onclick = async () => {
+        state.excluded_keywords = state.excluded_keywords.filter((w) => w !== word);
+        paintKeywords();
+        await save({ excluded_keywords: state.excluded_keywords });
+      };
+      keywordList.append(chip);
+    }
+  }
+
+  const addKeywords = async () => {
+    const added = keywordInput.value.split(',').map((w) => w.trim()).filter(Boolean);
+    if (!added.length) return;
+    for (const word of added) {
+      if (!state.excluded_keywords.some((w) => w.toLowerCase() === word.toLowerCase())) {
+        state.excluded_keywords.push(word);
+      }
+    }
+    keywordInput.value = '';
+    paintKeywords();
+    await save({ excluded_keywords: state.excluded_keywords });
+  };
+  keywordInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); addKeywords(); }
+  });
+  paintKeywords();
+
+  /* --- language --- */
+  const onlyLanguages = el('input', {
+    type: 'text', value: state.only_languages.join(', '),
+    placeholder: 'en   (blank = keep every language)',
+  });
+  onlyLanguages.addEventListener('change', async () => {
+    state.only_languages = onlyLanguages.value.split(',')
+      .map((l) => l.trim().toLowerCase()).filter(Boolean);
+    await save({ only_languages: state.only_languages });
+  });
+
+  /* --- numeric bounds --- */
+  const minDuration = numberField(settings.min_duration_seconds, 'min_duration_seconds', save);
+  const maxDuration = numberField(settings.max_duration_seconds, 'max_duration_seconds', save);
+  const minSubs = numberField(settings.min_channel_subscribers, 'min_channel_subscribers', save);
+  const maxSubs = numberField(settings.max_channel_subscribers, 'max_channel_subscribers', save);
+
+  const excludeLive = el('input', { type: 'checkbox', checked: settings.exclude_live !== false });
+  excludeLive.addEventListener('change', () => save({ exclude_live: excludeLive.checked }));
+
+  return el('div', { class: 'card' },
+    el('div', { class: 'card-head' },
+      el('div', {},
+        el('h2', { text: 'Exclusions' }),
+        el('div', { class: 'sub', text:
+          'What isn’t your niche. Applied to Outliers and Discover — and always ' +
+          'reported, so a hidden result is never a mystery.' }))),
+    el('div', { class: 'card-body stack' },
+
+      field('Categories to ignore', categoryChips,
+        'The strongest filter here: it catches content you would never have thought to ' +
+        'write a keyword for. Excluding Gaming drops every games video, however it is titled.'),
+
+      el('div', { class: 'divider' }),
+
+      el('div', { class: 'field' },
+        el('label', { text: 'Keywords to ignore' }),
+        keywordInput,
+        el('div', { class: 'help', text:
+          'Matched whole-word on titles and tags, so “war” will not hit “warranty”. ' +
+          'Add a trailing * for prefix matching, e.g. “minecraft*”. Comma-separate to add several.' }),
+        keywordList),
+
+      el('div', { class: 'divider' }),
+
+      el('div', { class: 'grid cols-2' },
+        field('Only these languages', onlyLanguages,
+          'Two-letter codes. Regional variants match their base, so “en” keeps en-GB and en-US.'),
+        el('div', { class: 'field' },
+          el('label', { text: 'Live broadcasts' }),
+          el('label', { class: 'switch' }, excludeLive, el('span', { class: 'track' }),
+            el('span', { class: 'small', text: 'Exclude live streams and their VODs' })),
+          el('div', { class: 'help', text:
+            'Live content accrues views on a completely different curve, so it distorts ' +
+            'any comparison against normal uploads.' }))),
+
+      el('div', { class: 'divider' }),
+
+      el('div', { class: 'grid cols-4' },
+        field('Shortest (seconds)', minDuration, '0 = no limit'),
+        field('Longest (seconds)', maxDuration, 'Cuts multi-hour stream VODs.'),
+        field('Smallest channel (subs)', minSubs, '0 = no limit'),
+        field('Largest channel (subs)', maxSubs,
+          'A channel far bigger than yours has a “normal” that tells you little.')),
+    ));
+}
+
+function numberField(value, key, save) {
+  const input = el('input', { type: 'number', min: 0, value: value || 0 });
+  input.addEventListener('change', () => save({ [key]: Number(input.value) || 0 }));
+  return input;
 }
 
 /* -------------------------------------------------------------- identity */

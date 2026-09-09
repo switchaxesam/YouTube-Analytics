@@ -138,6 +138,35 @@ class Settings:
     #: into one baseline produces nonsense multipliers.
     shorts_max_seconds: int = 180
 
+    # --- Exclusions --------------------------------------------------------
+    #: What isn't your niche. Applied across Outliers and Discover, always with
+    #: a visible count of what was removed — a filter that hides results
+    #: silently is indistinguishable from a bug.
+    #:
+    #: Words or phrases to drop, matched whole-word and case-insensitively on
+    #: the title and tags. A trailing ``*`` makes it a prefix match.
+    excluded_keywords: list[str] = field(default_factory=list)
+    #: YouTube category ids to drop wholesale, e.g. "20" for Gaming. Far more
+    #: reliable than keywords: it catches content you never thought to name.
+    excluded_category_ids: list[str] = field(default_factory=list)
+    #: Language codes to drop.
+    excluded_languages: list[str] = field(default_factory=list)
+    #: Or the inverse, which is stronger when you make one language: keep only
+    #: these. Empty means keep everything not explicitly excluded above.
+    only_languages: list[str] = field(default_factory=list)
+    #: Specific channels to ignore even if they surface in search.
+    excluded_channel_ids: list[str] = field(default_factory=list)
+    #: Duration bounds in seconds. A four-hour stream VOD is not a comparable
+    #: upload; 0 on either means no bound.
+    min_duration_seconds: int = 0
+    max_duration_seconds: int = 0
+    #: Channel-size bounds. A channel two orders of magnitude larger than yours
+    #: has a "normal" that tells you very little. 0 means no bound.
+    min_channel_subscribers: int = 0
+    max_channel_subscribers: int = 0
+    #: Live broadcasts accrue views on a completely different curve.
+    exclude_live: bool = True
+
     # --- Interface ---------------------------------------------------------
     #: "system", "light", or "dark".
     theme: str = "system"
