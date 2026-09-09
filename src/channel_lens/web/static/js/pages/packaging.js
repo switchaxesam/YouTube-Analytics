@@ -75,10 +75,12 @@ export async function render(view) {
 /* ----------------------------------------------------------- thumbnails */
 
 async function thumbnailsView(reload) {
-  const [patterns, outliers] = await Promise.all([
+  const [patterns, outliers, stored] = await Promise.all([
     api.get('/api/thumbnails/patterns', { min_multiplier: minMultiplier }),
     api.get('/api/outliers', { min_multiplier: minMultiplier, limit: 24 }),
+    api.get('/api/thumbnails/analyses', { min_multiplier: minMultiplier }),
   ]);
+  const analyses = stored.results || [];
 
   const nodes = [];
   const high = patterns.high_performers;
@@ -159,6 +161,11 @@ async function thumbnailsView(reload) {
     }
   }
 
+  // The legibility view: every analysed thumbnail rendered at the size it is
+  // actually chosen at, worst first. Reading a number about an image is far
+  // less convincing than seeing the image lose its detail.
+  if (analyses.length) nodes.push(legibilityCard(analyses, outliers.results));
+
   nodes.push(el('div', { class: 'card' },
     el('div', { class: 'card-head' },
       el('div', {}, el('h2', { text: 'The breakout thumbnails' }),
@@ -176,12 +183,97 @@ async function thumbnailsView(reload) {
   return nodes;
 }
 
-/** Grid tile image that falls back to an empty tile rather than a broken glyph. */
-function tileImage(url) {
-  if (!url) return el('div', { class: 'tile-blank' });
-  const img = el('img', { src: url, alt: '', loading: 'lazy' });
-  img.addEventListener('error', () => img.replaceWith(el('div', { class: 'tile-blank' })),
-    { once: true });
+/* Sizes a thumbnail is genuinely chosen at. Rendering the real image at these
+ * dimensions is not a simulation — it is the same downscale the browser does
+ * on YouTube itself. */
+const DISPLAY_W = 210, MOBILE_W = 168;
+
+function legibilityCard(analyses, results) {
+  const byId = new Map(results.map((r) => [r.video_id, r]));
+
+  // Worst first, ranked by how much survives the downscale.
+  const ranked = analyses
+    .filter((a) => a.detail_retention !== null && a.detail_retention !== undefined)
+    .sort((a, b) => a.detail_retention - b.detail_retention);
+
+  if (!ranked.length) return null;
+
+  const row = (a) => {
+    const video = byId.get(a.video_id) || {};
+    const notes = [];
+    if (a.detail_retention < 0.45) {
+      notes.push(`Only ${Math.round(a.detail_retention * 100)}% of its detail survives this size.`);
+    }
+    if (a.small_contrast !== null && a.small_contrast < 38) {
+      notes.push(`Contrast collapses when scaled down (${a.small_contrast.toFixed(0)} here vs ${(a.contrast || 0).toFixed(0)} full size).`);
+    }
+    if (a.text_area_estimate > 0.30) {
+      notes.push(`Text-like detail covers about ${Math.round(a.text_area_estimate * 100)}% of the frame.`);
+    }
+    if ((a.composition_note || '').startsWith('far ')) {
+      notes.push(`Visual weight sits ${a.composition_note}.`);
+    }
+
+    // The cached copy, not the live URL: these pictures sit beside numbers
+    // measured from that exact file, and a since-replaced thumbnail would make
+    // the pairing a lie.
+    const cached = `/api/thumbnails/image?url=${encodeURIComponent(a.thumbnail_url)}`;
+
+    return el('div', { class: 'legibility-row' },
+      el('div', { class: 'legibility-sizes' },
+        el('figure', {},
+          tileImage(cached, `${DISPLAY_W}px`),
+          el('figcaption', { class: 'small muted', text: `${DISPLAY_W}px — desktop` })),
+        el('figure', {},
+          tileImage(cached, `${MOBILE_W}px`),
+          el('figcaption', { class: 'small muted', text: `${MOBILE_W}px — phone` }))),
+      el('div', { class: 'legibility-meta' },
+        el('a', { class: 'title', href: video.url || '#', target: '_blank', rel: 'noopener',
+                  text: video.title || a.video_id }),
+        el('div', { class: 'row wrap mt-sm' },
+          metricChip('Detail kept', `${Math.round((a.detail_retention || 0) * 100)}%`,
+            a.detail_retention < 0.45),
+          metricChip('Contrast at size', (a.small_contrast || 0).toFixed(0),
+            (a.small_contrast || 0) < 38),
+          metricChip('Text-like area', `${Math.round((a.text_area_estimate || 0) * 100)}%`,
+            (a.text_area_estimate || 0) > 0.30),
+          metricChip('Weight', a.composition_note || '—',
+            (a.composition_note || '').startsWith('far '))),
+        notes.length
+          ? el('ul', { class: 'legibility-notes' },
+              notes.map((n) => el('li', { class: 'small dim', text: n })))
+          : el('p', { class: 'small muted mt-sm',
+              text: 'Nothing measurably wrong at display size.' })));
+  };
+
+  return el('div', { class: 'card' },
+    el('div', { class: 'card-head' },
+      el('div', {},
+        el('h2', { text: 'How they hold up at real size' }),
+        el('div', { class: 'sub', text:
+          'The same images at the sizes YouTube actually shows them, worst first. ' +
+          'All measured on your machine — no API key involved.' }))),
+    el('div', { class: 'card-body' }, ranked.slice(0, 12).map(row)));
+}
+
+function metricChip(label, value, bad) {
+  return el('span', { class: `metric-chip ${bad ? 'bad' : ''}` },
+    el('span', { class: 'metric-label', text: label }),
+    el('span', { class: 'metric-value', text: String(value) }));
+}
+
+/** Grid tile image that falls back to an empty tile rather than a broken glyph.
+ *
+ * ``width`` renders the real image at a real display size — the browser does
+ * the same downscale YouTube's page does, so this is the actual thing rather
+ * than an approximation of it.
+ */
+function tileImage(url, width) {
+  const style = width ? { width, flex: `0 0 ${width}` } : null;
+  if (!url) return el('div', { class: 'tile-blank', style });
+  const img = el('img', { src: url, alt: '', loading: 'lazy', style });
+  img.addEventListener('error',
+    () => img.replaceWith(el('div', { class: 'tile-blank', style })), { once: true });
   return img;
 }
 

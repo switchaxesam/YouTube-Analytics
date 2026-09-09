@@ -291,6 +291,129 @@ def test_quota_day_follows_pacific_not_local():
     assert quota_day(datetime(2026, 3, 2, 9, 0, tzinfo=timezone.utc)).day == 2
 
 
+# --------------------------------------------------- local thumbnail metrics
+
+
+def _image(draw_fn, size=(1280, 720), background=(20, 20, 30)):
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", size, background)
+    draw_fn(ImageDraw.Draw(img))
+    return img
+
+
+def test_detail_retention_separates_clean_from_mush():
+    """The metric that decides whether an image survives being shown small.
+
+    The first version compared mean edge energy before and after downscaling
+    and returned ~1.0 for everything, so it never fired. This asserts it
+    actually discriminates.
+    """
+    from PIL import Image
+
+    from channel_lens.services import thumbnails
+
+    clean = _image(lambda d: d.ellipse([200, 120, 900, 600], fill=(240, 90, 40)))
+    busy = Image.effect_noise((1280, 720), 80).convert("RGB")
+
+    clean_score = thumbnails.analyse_image(clean).detail_retention
+    busy_score = thumbnails.analyse_image(busy).detail_retention
+
+    assert clean_score > 0.85
+    assert busy_score < 0.5
+    assert thumbnails.analyse_image(busy).loses_detail is True
+    assert thumbnails.analyse_image(clean).loses_detail is False
+
+
+def test_visual_weight_is_not_dragged_to_centre_by_the_background():
+    """A large flat background must not outvote the actual subject.
+
+    Using absolute brightness made every centroid land dead centre, including
+    for a subject jammed against an edge.
+    """
+    from channel_lens.services import thumbnails
+
+    left = _image(lambda d: d.ellipse([40, 200, 380, 540], fill=(250, 200, 40)))
+    right = _image(lambda d: d.ellipse([900, 200, 1240, 540], fill=(250, 200, 40)))
+
+    assert thumbnails.analyse_image(left).weight_x < 0.4
+    assert thumbnails.analyse_image(right).weight_x > 0.6
+    assert "far right" in thumbnails.analyse_image(right).composition_note
+
+
+def test_text_like_detection_finds_an_overlay_and_ignores_a_plain_image():
+    from channel_lens.services import thumbnails
+
+    plain = _image(lambda d: d.ellipse([400, 200, 880, 520], fill=(120, 120, 130)))
+
+    def dense_text(d):
+        for row in range(5):
+            for x in range(60, 1220, 7):
+                d.rectangle([x, 120 + row * 120, x + 3, 200 + row * 120],
+                            fill=(255, 255, 255))
+
+    texty = _image(dense_text)
+
+    assert thumbnails.analyse_image(plain).text_area_estimate < 0.05
+    assert thumbnails.analyse_image(texty).text_area_estimate > 0.15
+    assert thumbnails.analyse_image(texty).is_text_heavy is True
+
+
+def test_a_flat_image_is_not_reported_as_losing_detail():
+    """Nothing to lose is not a legibility failure."""
+    from PIL import Image
+
+    from channel_lens.services import thumbnails
+
+    flat = Image.new("RGB", (640, 360), (128, 128, 128))
+    assert thumbnails.analyse_image(flat).detail_retention == 1.0
+
+
+def test_observations_stay_silent_on_a_good_thumbnail():
+    """Silence is what gives the warnings their weight."""
+    from channel_lens.services import thumbnails
+
+    good = _image(
+        lambda d: (d.ellipse([120, 140, 620, 600], fill=(245, 95, 45)),
+                   d.rectangle([700, 250, 1180, 430], fill=(250, 250, 250))),
+        background=(40, 60, 110),
+    )
+    notes = thumbnails.analyse_image(good).observations()
+    assert not any("detail survives" in n for n in notes)
+    assert not any("Visually busy" in n for n in notes)
+
+
+def test_missing_columns_are_added_to_an_existing_database():
+    """create_all never ALTERs, so a new column on an old database is absent.
+
+    That is the failure this project hit twice; it surfaces later as an
+    opaque 'no such column' at query time.
+    """
+    from sqlalchemy import Column, Float
+
+    from channel_lens import db
+    from channel_lens.models import ThumbnailAnalysis
+
+    table = ThumbnailAnalysis.__table__
+    table.append_column(Column("a_later_addition", Float, nullable=True))
+    try:
+        added = db.add_missing_columns()
+        assert "thumbnail_analyses.a_later_addition" in added
+
+        with db.get_engine().begin() as connection:
+            columns = {
+                row[1] for row in connection.exec_driver_sql(
+                    "PRAGMA table_info('thumbnail_analyses')"
+                )
+            }
+        assert "a_later_addition" in columns
+
+        # Running again is a no-op rather than an error.
+        assert db.add_missing_columns() == []
+    finally:
+        table._columns.remove(table.c.a_later_addition)
+
+
 # -------------------------------------------------------------------- PKCE
 
 

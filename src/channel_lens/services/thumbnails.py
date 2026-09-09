@@ -20,12 +20,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Sequence
 
 import httpx
+import numpy as np
 from PIL import Image, ImageFilter, ImageStat
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -47,6 +48,26 @@ BUSY_EDGE_DENSITY = 0.14
 #: Luminance standard deviation below which a thumbnail is called low-contrast.
 LOW_CONTRAST = 45.0
 
+#: The size a thumbnail is actually chosen at on a desktop homepage. Every
+#: legibility judgement is made here rather than at full resolution, because
+#: this is the only size the viewer ever sees before deciding.
+DISPLAY_SIZE = (210, 118)
+
+#: And roughly the size in a phone feed, where most watching now happens.
+MOBILE_SIZE = (168, 94)
+
+#: Below this share of edge detail surviving the downscale, the image is
+#: carrying detail that vanishes at the size it is displayed.
+POOR_DETAIL_RETENTION = 0.45
+
+#: Contrast floor measured *after* downscaling. Lower than the full-size floor
+#: because downscaling averages pixels together and always reduces spread.
+LOW_SMALL_CONTRAST = 38.0
+
+#: Text-like coverage beyond which the overlay is competing with the image
+#: rather than supporting it.
+HEAVY_TEXT_AREA = 0.30
+
 
 class ThumbnailError(Exception):
     """Downloading or decoding a thumbnail failed."""
@@ -64,6 +85,14 @@ class LocalFeatures:
     contrast: float
     edge_density: float
 
+    small_contrast: float = 0.0
+    detail_retention: float = 1.0
+    weight_x: float = 0.5
+    weight_y: float = 0.5
+    composition_note: str = ""
+    text_area_estimate: float = 0.0
+    text_bands: list[dict[str, float]] = field(default_factory=list)
+
     @property
     def is_busy(self) -> bool:
         return self.edge_density > BUSY_EDGE_DENSITY
@@ -71,6 +100,14 @@ class LocalFeatures:
     @property
     def is_low_contrast(self) -> bool:
         return self.contrast < LOW_CONTRAST
+
+    @property
+    def loses_detail(self) -> bool:
+        return self.detail_retention < POOR_DETAIL_RETENTION
+
+    @property
+    def is_text_heavy(self) -> bool:
+        return self.text_area_estimate > HEAVY_TEXT_AREA
 
     def observations(self) -> list[str]:
         """Plain-language readings of the measurements.
@@ -80,7 +117,18 @@ class LocalFeatures:
         is what gives the warnings their weight.
         """
         notes: list[str] = []
-        if self.is_low_contrast:
+        if self.loses_detail:
+            notes.append(
+                f"Only about {self.detail_retention * 100:.0f}% of its detail survives being "
+                f"shown at {DISPLAY_SIZE[0]}×{DISPLAY_SIZE[1]} — most of what is in this "
+                f"image never reaches the viewer before they decide."
+            )
+        if self.small_contrast and self.small_contrast < LOW_SMALL_CONTRAST:
+            notes.append(
+                f"Contrast collapses when scaled down (spread {self.small_contrast:.0f} at "
+                f"display size, {self.contrast:.0f} at full size)."
+            )
+        elif self.is_low_contrast:
             notes.append(
                 f"Low contrast (luminance spread {self.contrast:.0f}). Likely to blend "
                 f"into the page at sidebar size."
@@ -89,6 +137,16 @@ class LocalFeatures:
             notes.append(
                 f"Visually busy ({self.edge_density * 100:.0f}% of pixels on a hard edge). "
                 f"Detail this dense turns to mush when scaled down."
+            )
+        if self.is_text_heavy:
+            notes.append(
+                f"Text-like detail covers roughly {self.text_area_estimate * 100:.0f}% of the "
+                f"frame — enough to compete with the image rather than support it."
+            )
+        if self.composition_note.startswith("far "):
+            notes.append(
+                f"Visual weight sits {self.composition_note}. YouTube crops thumbnails "
+                f"differently across surfaces, and anything near an edge is what goes first."
             )
         if self.mean_brightness < 60:
             notes.append("Very dark overall — dark thumbnails lose ground against a light UI.")
@@ -107,10 +165,243 @@ class LocalFeatures:
             "mean_saturation": round(self.mean_saturation, 1),
             "contrast": round(self.contrast, 1),
             "edge_density": round(self.edge_density, 4),
+            "small_contrast": round(self.small_contrast, 1),
+            "detail_retention": round(self.detail_retention, 3),
+            "weight_x": round(self.weight_x, 3),
+            "weight_y": round(self.weight_y, 3),
+            "composition_note": self.composition_note,
+            "text_area_estimate": round(self.text_area_estimate, 4),
+            "text_bands": self.text_bands,
             "is_busy": self.is_busy,
             "is_low_contrast": self.is_low_contrast,
+            "loses_detail": self.loses_detail,
+            "is_text_heavy": self.is_text_heavy,
             "observations": self.observations(),
         }
+
+
+def _edge_array(image: Image.Image) -> "np.ndarray":
+    """Edge magnitude for a greyscale image, as a float array in 0–255."""
+    return np.asarray(image.filter(ImageFilter.FIND_EDGES), dtype=float)
+
+
+def detail_retention(grey: Image.Image, size: tuple[int, int] = DISPLAY_SIZE) -> float:
+    """How much of the image survives being shown at ``size``.
+
+    Full-resolution sharpness is not what a viewer sees. This shrinks the image
+    to the size it is genuinely chosen at, scales it back up, and measures how
+    far the result has drifted from the original. Whatever cannot be
+    reconstructed is information the viewer never receives before deciding
+    whether to click.
+
+    The difference is expressed against the image's own contrast, so a
+    low-contrast image is not penalised twice — that is what
+    :attr:`LocalFeatures.small_contrast` is for.
+
+    Returns 0–1, higher meaning more survives.
+
+    A few large shapes come through almost intact:
+
+    >>> from PIL import Image, ImageDraw
+    >>> clean = Image.new("L", (1280, 720), 30)
+    >>> _d = ImageDraw.Draw(clean).rectangle([400, 200, 880, 520], fill=230)
+    >>> detail_retention(clean) > 0.9
+    True
+
+    Fine detail does not:
+
+    >>> busy = Image.effect_noise((1280, 720), 90)
+    >>> detail_retention(busy) < 0.5
+    True
+    >>> detail_retention(clean) > detail_retention(busy)
+    True
+
+    A perfectly flat image has nothing to lose, which is not a legibility
+    problem and must not be reported as one:
+
+    >>> detail_retention(Image.new("L", (640, 360), 128))
+    1.0
+    """
+    original = np.asarray(grey, dtype=float)
+    spread = float(original.std())
+    if spread <= 1.0:
+        return 1.0
+
+    shrunk = grey.resize(size, Image.Resampling.LANCZOS)
+    restored = np.asarray(
+        shrunk.resize(grey.size, Image.Resampling.LANCZOS), dtype=float
+    )
+
+    lost = float(np.abs(original - restored).mean())
+    return float(max(0.0, min(1.0, 1.0 - lost / spread)))
+
+
+def visual_weight(rgb: Image.Image) -> tuple[float, float]:
+    """Centre of visual weight, as fractions of width and height.
+
+    Weight combines edge energy with colour intensity — the two things that
+    pull the eye — so it does not need to recognise anything to say where a
+    thumbnail's attention sits. It is a centre of mass, not a subject detector:
+    two subjects on opposite sides average to the middle, which the caller has
+    to keep in mind.
+
+    Weight is measured as *departure from the background*, not as absolute
+    brightness or colour. Using absolute values makes a large uniform
+    background contribute weight across the whole frame, which drags every
+    centroid toward the middle — the first version of this did exactly that
+    and reported "dead centre" for a subject jammed against the right edge.
+
+    >>> from PIL import Image, ImageDraw
+    >>> img = Image.new("RGB", (400, 200), (10, 10, 10))
+    >>> _d = ImageDraw.Draw(img).ellipse([20, 40, 120, 160], fill=(250, 80, 40))
+    >>> x, y = visual_weight(img)
+    >>> x < 0.4            # weight sits on the left
+    True
+    >>> 0.35 < y < 0.65    # and vertically centred
+    True
+
+    A subject against the opposite edge lands on the opposite side:
+
+    >>> img2 = Image.new("RGB", (400, 200), (10, 10, 10))
+    >>> _d = ImageDraw.Draw(img2).ellipse([300, 40, 390, 160], fill=(250, 200, 40))
+    >>> visual_weight(img2)[0] > 0.7
+    True
+    """
+    grey = rgb.convert("L")
+    luminance = np.asarray(grey, dtype=float)
+    edges = _edge_array(grey)
+    saturation = np.asarray(rgb.convert("HSV"), dtype=float)[:, :, 1]
+
+    # Deviation from the typical pixel. A flat background sits at the median in
+    # both channels and therefore contributes almost nothing.
+    luminance_pull = np.abs(luminance - float(np.median(luminance)))
+    colour_pull = np.abs(saturation - float(np.median(saturation)))
+
+    weight = edges + luminance_pull + colour_pull * 0.5
+    total = float(weight.sum())
+    if total <= 0:
+        return 0.5, 0.5
+
+    height, width = weight.shape
+    xs = np.arange(width, dtype=float)
+    ys = np.arange(height, dtype=float)
+    cx = float((weight.sum(axis=0) * xs).sum() / total)
+    cy = float((weight.sum(axis=1) * ys).sum() / total)
+    return cx / max(1, width - 1), cy / max(1, height - 1)
+
+
+def describe_composition(x: float, y: float, tolerance: float = 0.09) -> str:
+    """Name where the visual weight sits, in terms a person can act on.
+
+    The rule of thirds is a convention rather than a law, so this reports the
+    position and lets the reader decide; it never scores the composition.
+
+    >>> describe_composition(0.34, 0.34)
+    'on the upper-left third'
+    >>> describe_composition(0.5, 0.5)
+    'dead centre'
+    >>> describe_composition(0.85, 0.5)
+    'far right, close to the edge'
+    >>> describe_composition(0.5, 0.2)
+    'high and centred'
+    """
+    if x > 0.8 or x < 0.2:
+        side = "right" if x > 0.5 else "left"
+        return f"far {side}, close to the edge"
+
+    thirds = (1 / 3, 2 / 3)
+    near_x = min(thirds, key=lambda t: abs(x - t))
+    near_y = min(thirds, key=lambda t: abs(y - t))
+    if abs(x - near_x) <= tolerance and abs(y - near_y) <= tolerance:
+        horizontal = "left" if near_x < 0.5 else "right"
+        vertical = "upper" if near_y < 0.5 else "lower"
+        return f"on the {vertical}-{horizontal} third"
+
+    if abs(x - 0.5) <= tolerance and abs(y - 0.5) <= tolerance:
+        return "dead centre"
+    if abs(x - 0.5) <= tolerance:
+        return "high and centred" if y < 0.5 else "low and centred"
+    if abs(y - 0.5) <= tolerance:
+        return "centred, offset left" if x < 0.5 else "centred, offset right"
+    return "off-centre"
+
+
+def text_like_regions(
+    grey: Image.Image, cell: int = 20
+) -> tuple[float, list[dict[str, float]]]:
+    """Find dense, high-contrast bands that behave like overlaid text.
+
+    Text has a signature that needs no OCR: locally busy, locally
+    high-contrast, and arranged in horizontal runs. This measures that
+    signature over a grid and groups the hits into bands.
+
+    It is honestly an *estimate*. Fine texture — foliage, wood grain, gravel —
+    has the same local statistics, so the number is reported as "text-like"
+    everywhere it surfaces, never as "text".
+
+    Returns ``(covered_fraction, bands)``.
+
+    >>> from PIL import Image, ImageDraw
+    >>> blank = Image.new("L", (640, 360), 128)
+    >>> area, bands = text_like_regions(blank)
+    >>> area == 0.0 and bands == []
+    True
+
+    A bright block of dense stripes across the lower third registers, and lands
+    in the lower part of the frame:
+
+    >>> striped = Image.new("L", (640, 360), 20)
+    >>> d = ImageDraw.Draw(striped)
+    >>> for x in range(40, 600, 6):
+    ...     _ = d.rectangle([x, 250, x + 3, 320], fill=255)
+    >>> area, bands = text_like_regions(striped)
+    >>> area > 0.05
+    True
+    >>> bands[0]["top"] > 0.5
+    True
+    """
+    array = np.asarray(grey, dtype=float)
+    edges = _edge_array(grey)
+    height, width = array.shape
+
+    rows, cols = max(1, height // cell), max(1, width // cell)
+    covered = np.zeros((rows, cols), dtype=bool)
+
+    for r in range(rows):
+        for c in range(cols):
+            y0, y1 = r * cell, min(height, (r + 1) * cell)
+            x0, x1 = c * cell, min(width, (c + 1) * cell)
+            block_edges = edges[y0:y1, x0:x1]
+            block_pixels = array[y0:y1, x0:x1]
+            if block_edges.size == 0:
+                continue
+            # Both conditions must hold: busy *and* high-contrast. Busy alone
+            # is texture; contrast alone is a plain hard-edged shape.
+            covered[r, c] = block_edges.mean() > 26.0 and block_pixels.std() > 46.0
+
+    fraction = float(covered.mean()) if covered.size else 0.0
+    if fraction <= 0:
+        return 0.0, []
+
+    # Collapse to horizontal bands: text runs across, so a row of the grid with
+    # several hits is far more likely to be text than isolated scattered cells.
+    row_coverage = covered.mean(axis=1)
+    bands: list[dict[str, float]] = []
+    start: int | None = None
+    for r in range(rows + 1):
+        active = r < rows and row_coverage[r] >= 0.2
+        if active and start is None:
+            start = r
+        elif not active and start is not None:
+            band_rows = row_coverage[start:r]
+            bands.append({
+                "top": round(start / rows, 3),
+                "bottom": round(r / rows, 3),
+                "coverage": round(float(band_rows.mean()), 3),
+            })
+            start = None
+
+    return round(fraction, 4), bands
 
 
 def _cache_path(url: str) -> Path:
@@ -193,6 +484,15 @@ def analyse_image(image: Image.Image) -> LocalFeatures:
     strong = sum(histogram[64:])
     edge_density = strong / total
 
+    # Everything below judges the image at the size it is actually chosen at,
+    # rather than at the resolution it was uploaded in.
+    small_grey = grey.resize(DISPLAY_SIZE, Image.Resampling.LANCZOS)
+    small_contrast = float(ImageStat.Stat(small_grey).stddev[0])
+    retention = detail_retention(grey)
+
+    wx, wy = visual_weight(rgb)
+    text_area, text_bands = text_like_regions(grey)
+
     return LocalFeatures(
         width=original_size[0],
         height=original_size[1],
@@ -201,6 +501,13 @@ def analyse_image(image: Image.Image) -> LocalFeatures:
         mean_saturation=saturation,
         contrast=contrast,
         edge_density=edge_density,
+        small_contrast=small_contrast,
+        detail_retention=retention,
+        weight_x=wx,
+        weight_y=wy,
+        composition_note=describe_composition(wx, wy),
+        text_area_estimate=text_area,
+        text_bands=text_bands,
     )
 
 
@@ -412,6 +719,13 @@ def analyse_video_thumbnail(
     row.mean_saturation = local.mean_saturation
     row.contrast = local.contrast
     row.edge_density = local.edge_density
+    row.small_contrast = local.small_contrast
+    row.detail_retention = local.detail_retention
+    row.weight_x = local.weight_x
+    row.weight_y = local.weight_y
+    row.composition_note = local.composition_note
+    row.text_area_estimate = local.text_area_estimate
+    row.text_bands = local.text_bands
     if existing is None:
         session.add(row)
 
@@ -512,10 +826,30 @@ def summarise_pattern(analyses: Sequence[ThumbnailAnalysis]) -> dict[str, Any]:
                 }
             )
 
+    # Local measurements, present for every analysed thumbnail whether or not
+    # a vision model was ever involved.
     busy = sum(1 for a in analyses if (a.edge_density or 0) > BUSY_EDGE_DENSITY)
     low_contrast = sum(1 for a in analyses if (a.contrast or 999) < LOW_CONTRAST)
+    fading = sum(
+        1 for a in analyses
+        if a.detail_retention is not None and a.detail_retention < POOR_DETAIL_RETENTION
+    )
+    text_heavy = sum(
+        1 for a in analyses
+        if a.text_area_estimate is not None and a.text_area_estimate > HEAVY_TEXT_AREA
+    )
+    off_centre = sum(
+        1 for a in analyses if (a.composition_note or "").startswith("far ")
+    )
     add("Visually busy", busy, "Dense detail that degrades when scaled down.")
     add("Low contrast", low_contrast, "Risks blending into the surrounding page.")
+    add("Loses detail at display size", fading,
+        f"Under {POOR_DETAIL_RETENTION * 100:.0f}% of their detail survives "
+        f"{DISPLAY_SIZE[0]}×{DISPLAY_SIZE[1]}.")
+    add("Heavy text-like coverage", text_heavy,
+        "Overlay competing with the image rather than supporting it.")
+    add("Weight near an edge", off_centre,
+        "Vulnerable to how YouTube crops across surfaces.")
 
     colours: list[str] = []
     for analysis in analyses:

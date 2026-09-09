@@ -233,6 +233,32 @@ class ThumbnailAnalysis(Base):
     #: image that will turn to mush at sidebar size.
     edge_density: Mapped[float | None] = mapped_column(Float)
 
+    # -- Legibility at the size it is actually chosen ----------------------
+    #: Contrast measured after downscaling to homepage size. The full-size
+    #: figure flatters an image; this is the one that decides anything.
+    small_contrast: Mapped[float | None] = mapped_column(Float)
+    #: Share of edge detail surviving that downscale, 0–1. A low value means
+    #: the image carries detail that simply disappears when it is shown small.
+    detail_retention: Mapped[float | None] = mapped_column(Float)
+
+    # -- Composition, measured rather than described -----------------------
+    #: Centre of visual weight, as fractions of width and height. Derived from
+    #: edge energy and colour intensity, not from recognising anything.
+    weight_x: Mapped[float | None] = mapped_column(Float)
+    weight_y: Mapped[float | None] = mapped_column(Float)
+    #: Plain-language read of where that centre sits relative to the
+    #: rule-of-thirds intersections and the frame centre.
+    composition_note: Mapped[str | None] = mapped_column(String(64))
+
+    # -- Text-like regions, detected locally -------------------------------
+    #: Estimated share of the frame occupied by text-like regions: dense,
+    #: high-contrast, horizontally-banded detail. An estimate, not a reading —
+    #: fine texture can look like text to it.
+    text_area_estimate: Mapped[float | None] = mapped_column(Float)
+    #: Horizontal bands where that detail concentrates, as
+    #: ``{"top": 0.0-1.0, "bottom": 0.0-1.0, "coverage": 0.0-1.0}``.
+    text_bands: Mapped[list | None] = mapped_column(JSON)
+
     # -- Vision model, paid ------------------------------------------------
     model: Mapped[str | None] = mapped_column(String(64))
     face_count: Mapped[int | None] = mapped_column(Integer)

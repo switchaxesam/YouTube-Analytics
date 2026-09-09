@@ -12,6 +12,7 @@ reads; without it, SQLite's default locking turns a routine poll into
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -20,6 +21,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from .config import database_path
 from .models import Base
+
+log = logging.getLogger(__name__)
 
 _engine: Engine | None = None
 _session_factory: sessionmaker[Session] | None = None
@@ -72,13 +75,79 @@ def session_scope() -> Iterator[Session]:
 
 
 def init_db() -> None:
-    """Create any missing tables.
+    """Create missing tables, then add any missing columns to existing ones.
 
-    The schema is additive only — new columns arrive with defaults and old rows
-    stay valid — so plain ``create_all`` is enough and there is no migration
-    tool here. If that ever stops being true, this is where Alembic goes.
+    ``create_all`` creates tables but never alters them, so on an install that
+    already has a database a newly added column simply doesn't exist — and the
+    failure arrives later as a confusing ``no such column`` at query time. That
+    has caught this project twice, so the column check runs on every startup.
     """
     Base.metadata.create_all(get_engine())
+    add_missing_columns()
+
+
+#: SQLite type names for the column types this schema actually uses.
+_SQLITE_TYPES = {
+    "INTEGER": "INTEGER", "BIGINT": "INTEGER", "SMALLINT": "INTEGER",
+    "VARCHAR": "TEXT", "TEXT": "TEXT", "FLOAT": "REAL", "NUMERIC": "NUMERIC",
+    "BOOLEAN": "BOOLEAN", "DATETIME": "DATETIME", "DATE": "DATE", "JSON": "JSON",
+}
+
+
+def add_missing_columns() -> list[str]:
+    """Add columns present in the models but missing from the database.
+
+    A deliberately minimal migration step, not a migration tool. SQLite's
+    ``ALTER TABLE ... ADD COLUMN`` can only append a nullable column (or one
+    with a constant default), which is exactly the additive-only change this
+    schema is allowed to make. Anything else — renames, type changes, new
+    constraints — is out of scope and would need Alembic.
+
+    Returns the ``table.column`` names added, for logging.
+    """
+    engine = get_engine()
+    added: list[str] = []
+
+    with engine.begin() as connection:
+        existing_tables = {
+            row[0] for row in connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+
+        for table in Base.metadata.sorted_tables:
+            if table.name not in existing_tables:
+                continue  # create_all just made it, so it is already current.
+
+            present = {
+                row[1] for row in connection.exec_driver_sql(
+                    f"PRAGMA table_info('{table.name}')"
+                )
+            }
+
+            for column in table.columns:
+                if column.name in present:
+                    continue
+                if not column.nullable and column.server_default is None:
+                    # Cannot be added to a table with existing rows.
+                    log.warning(
+                        "Cannot add non-nullable column %s.%s automatically; "
+                        "it needs a real migration.", table.name, column.name,
+                    )
+                    continue
+
+                type_name = type(column.type).__name__.upper()
+                sql_type = _SQLITE_TYPES.get(
+                    type_name, column.type.compile(engine.dialect)
+                )
+                connection.exec_driver_sql(
+                    f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {sql_type}'
+                )
+                added.append(f"{table.name}.{column.name}")
+
+    if added:
+        log.info("Added missing columns: %s", ", ".join(added))
+    return added
 
 
 def reset_state_for_tests() -> None:

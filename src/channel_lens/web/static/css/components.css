@@ -159,6 +159,43 @@ input.saved, select.saved {
   transition: transform .16s var(--ease);
 }
 .thumb-tile:hover { transform: translateY(-2px); }
+/* Legibility view: the real image at the real size it gets chosen at. */
+.legibility-row {
+  display: flex; gap: 18px; align-items: flex-start;
+  padding: 16px 0;
+}
+.legibility-row + .legibility-row { border-top: 1px solid var(--border); }
+.legibility-sizes { display: flex; gap: 12px; align-items: flex-start; flex: none; }
+.legibility-sizes figure { margin: 0; }
+.legibility-sizes img, .legibility-sizes .tile-blank {
+  aspect-ratio: 16 / 9; object-fit: cover; display: block;
+  border-radius: var(--r-sm); border: 1px solid var(--border);
+  background: var(--surface-3);
+}
+.legibility-sizes figcaption { margin-top: 5px; text-align: center; }
+.legibility-meta { min-width: 0; flex: 1; }
+.legibility-meta .title { font-weight: 550; line-height: 1.35; }
+.legibility-meta .title:hover { color: var(--accent); }
+.legibility-notes { margin: 10px 0 0; padding-left: 17px; }
+.legibility-notes li { margin-bottom: 3px; }
+
+.metric-chip {
+  display: inline-flex; align-items: baseline; gap: 6px;
+  padding: 3px 9px; border-radius: 999px;
+  background: var(--surface-2); border: 1px solid var(--border);
+  font-size: .75rem;
+}
+.metric-chip.bad {
+  border-color: rgba(250, 178, 25, .45);
+  background: rgba(250, 178, 25, .10);
+}
+.metric-label { color: var(--ink-muted); }
+.metric-value { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+@media (max-width: 760px) {
+  .legibility-row { flex-direction: column; }
+}
+
 .thumb-tile img, .tile-blank {
   width: 100%; aspect-ratio: 16 / 9; object-fit: cover;
   border-radius: var(--r-md); background: var(--surface-3);

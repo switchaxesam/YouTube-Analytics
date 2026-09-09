@@ -606,6 +606,47 @@ def test_polling_an_unknown_job_explains_itself(client):
     assert response.json()["hint"]
 
 
+# --------------------------------------------------- cached thumbnail images
+
+
+def test_cached_thumbnail_is_served_so_it_matches_its_analysis(client):
+    """The legibility view pairs a picture with numbers measured from it.
+
+    Serving the live URL would show whatever YouTube returns now beside
+    measurements taken from what it returned then.
+    """
+    from PIL import Image
+
+    from channel_lens.services import thumbnails
+
+    url = "https://i.ytimg.com/vi/testvid1234/maxresdefault.jpg"
+    Image.new("RGB", (1280, 720), (200, 40, 40)).save(
+        thumbnails._cache_path(url), "JPEG")
+
+    response = client.get("/api/thumbnails/image", params={"url": url})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/jpeg"
+    assert "immutable" in response.headers.get("cache-control", "")
+    assert len(response.content) > 500
+
+
+def test_an_uncached_thumbnail_says_so_rather_than_erroring(client):
+    response = client.get("/api/thumbnails/image", params={
+        "url": "https://i.ytimg.com/vi/neverfetched/maxresdefault.jpg",
+    })
+    assert response.status_code == 404
+    assert "analysis" in response.json()["hint"]
+
+
+def test_a_hostile_url_cannot_escape_the_cache_directory(client):
+    """The filename is hashed from the URL, so traversal is structurally impossible."""
+    for hostile in ("../../../../etc/passwd", "..\\..\\windows\\win.ini",
+                    "/etc/shadow", "C:\\Windows\\System32\\config\\SAM"):
+        response = client.get("/api/thumbnails/image", params={"url": hostile})
+        assert response.status_code == 404
+
+
 # ------------------------------------------------- videos from unknown channels
 
 

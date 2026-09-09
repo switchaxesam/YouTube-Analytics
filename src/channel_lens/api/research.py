@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
@@ -909,6 +910,14 @@ def _thumbnail_dict(row: ThumbnailAnalysis) -> dict[str, Any]:
         "mean_saturation": row.mean_saturation,
         "contrast": row.contrast,
         "edge_density": row.edge_density,
+        # Measured locally, free, and present on every analysed thumbnail.
+        "small_contrast": row.small_contrast,
+        "detail_retention": row.detail_retention,
+        "weight_x": row.weight_x,
+        "weight_y": row.weight_y,
+        "composition_note": row.composition_note,
+        "text_area_estimate": row.text_area_estimate,
+        "text_bands": row.text_bands or [],
         "has_vision": bool(row.model),
         "model": row.model,
         "face_count": row.face_count,
@@ -977,6 +986,59 @@ def analyse_thumbnails(
         "vision_available": config.has_vision,
         "errors": errors,
     }
+
+
+@router.get("/thumbnails/image")
+def thumbnail_image(url: str = Query(..., description="The thumbnail URL that was analysed")):
+    """Serve the cached copy of a thumbnail that was actually analysed.
+
+    The obvious alternative — pointing an ``<img>`` straight at YouTube — has a
+    real flaw: it shows whatever the URL serves *now*, beside numbers computed
+    from what it served *then*. Serving the cached file guarantees the picture
+    and the measurements describe the same image.
+
+    It also means the legibility view keeps working offline, and doesn't depend
+    on YouTube's CDN allowing hotlinks.
+
+    Path traversal is impossible: the filename is derived by hashing the URL
+    here, so nothing the caller sends reaches the filesystem verbatim.
+    """
+    path = thumbnails._cache_path(url)
+    if not path.exists():
+        raise NotFound(
+            "That thumbnail hasn't been downloaded yet.",
+            "Run the analysis on this set first — the image is cached as part of it.",
+        )
+    return FileResponse(
+        path,
+        media_type="image/jpeg",
+        # Cache hard: the file is immutable, keyed on a URL YouTube itself
+        # replaces rather than reuses.
+        headers={"Cache-Control": "public, max-age=604800, immutable"},
+    )
+
+
+@router.get("/thumbnails/analyses")
+def stored_thumbnail_analyses(
+    min_multiplier: float = Query(3.0, ge=0),
+    channel_id: list[str] | None = Query(None),
+    limit: int = Query(60, ge=1, le=300),
+    session: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Thumbnail analyses already computed, newest first. Costs nothing.
+
+    Reads stored rows rather than re-analysing, so the legibility view can be
+    opened as often as you like without re-downloading a single image.
+    """
+    query = (
+        select(ThumbnailAnalysis)
+        .join(Video, Video.id == ThumbnailAnalysis.video_id)
+        .where(Video.outlier_multiplier >= min_multiplier)
+    )
+    if channel_id:
+        query = query.where(Video.channel_id.in_(channel_id))
+    rows = list(session.scalars(query.limit(limit)).all())
+    return {"results": [_thumbnail_dict(r) for r in rows], "count": len(rows)}
 
 
 @router.get("/thumbnails/patterns")
