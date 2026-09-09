@@ -225,17 +225,69 @@ def _maybe_snapshot(session: Session, video: Video, stats: dict) -> VideoStat | 
     return snapshot
 
 
+def ensure_channels(
+    client: YouTubeClient, session: Session, payloads: list[dict]
+) -> set[str]:
+    """Create any channel rows these videos refer to, and report the unfetchable.
+
+    ``videos.channel_id`` is a foreign key, so a video whose channel has no row
+    cannot be inserted at all — SQLite rejects the statement outright. Paths
+    that walk a channel's uploads never hit this, because the channel is
+    created first by definition. Search does: it returns videos from channels
+    that have never been seen before.
+
+    Costs 1 unit per 50 channels, and only for channels not already stored, so
+    the common case is free.
+
+    Returns the ids that still have no row afterwards. A channel can genuinely
+    be unfetchable — deleted, suspended, or region-blocked — while its videos
+    still appear in search results, and those videos have to be skipped rather
+    than allowed to abort the whole batch.
+    """
+    wanted = {
+        (p.get("snippet") or {}).get("channelId")
+        for p in payloads
+    }
+    wanted.discard(None)
+    wanted.discard("")
+
+    missing = [cid for cid in wanted if session.get(Channel, cid) is None]
+    if not missing:
+        return set()
+
+    for raw in client.get_channels(missing):
+        upsert_channel(session, raw)
+
+    unresolved = {cid for cid in missing if session.get(Channel, cid) is None}
+    if unresolved:
+        log.warning(
+            "Skipping videos from %d channel(s) YouTube would not return: %s",
+            len(unresolved), ", ".join(sorted(unresolved)),
+        )
+    return unresolved
+
+
 def ingest_videos(
     client: YouTubeClient, session: Session, video_ids: list[str], *,
     shorts_max_seconds: int,
 ) -> tuple[list[Video], list[VideoRevision]]:
-    """Fetch and store a batch of videos. 1 unit per 50."""
+    """Fetch and store a batch of videos. 1 unit per 50.
+
+    Channels are resolved first. A video row cannot exist without its channel
+    row, so this ordering is a correctness requirement rather than a nicety.
+    """
     if not video_ids:
         return [], []
     payloads = client.get_videos(video_ids)
+
+    unresolved = ensure_channels(client, session, payloads)
+
     videos: list[Video] = []
     revisions: list[VideoRevision] = []
     for payload in payloads:
+        channel_id = (payload.get("snippet") or {}).get("channelId")
+        if not channel_id or channel_id in unresolved:
+            continue
         video, revs = upsert_video(session, payload, shorts_max_seconds=shorts_max_seconds)
         videos.append(video)
         revisions.extend(revs)

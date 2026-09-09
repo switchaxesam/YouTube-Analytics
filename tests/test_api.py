@@ -370,3 +370,96 @@ def test_bulk_import_rejects_empty_text(client):
     client.put("/api/settings", json={"youtube_api_key": "AIzaTEST"})
     response = client.post("/api/channels/bulk", json={"text": "   \n\n  "})
     assert response.status_code == 400
+
+
+# ------------------------------------------------- videos from unknown channels
+
+
+def _stub_search(monkeypatch, *, unfetchable_channel: str = ""):
+    """Stub search returning videos from channels not yet in the database.
+
+    That is the situation search uniquely creates: every other path walks a
+    channel's own uploads, so the channel row exists by construction.
+    """
+    from channel_lens.youtube import client as yt
+
+    def search(self, query, **kwargs):
+        self.ledger.record(self.session, "search.list")
+        return ["vidAAAAAAAA", "vidBBBBBBBB"]
+
+    def get_videos(self, video_ids):
+        self.ledger.record(self.session, "videos.list")
+        mapping = {"vidAAAAAAAA": "UCknown0000000000000000",
+                   "vidBBBBBBBB": unfetchable_channel or "UCknown0000000000000000"}
+        return [{
+            "id": vid,
+            "snippet": {"title": f"Video {vid}", "channelId": mapping[vid],
+                        "publishedAt": "2026-08-01T00:00:00Z",
+                        "thumbnails": {"high": {"url": "https://x/v.jpg"}},
+                        "tags": [], "categoryId": "20"},
+            "statistics": {"viewCount": "1193730", "likeCount": "27580",
+                           "commentCount": "2335"},
+            "contentDetails": {"duration": "PT8M23S"},
+        } for vid in video_ids]
+
+    def get_channels(self, channel_ids):
+        self.ledger.record(self.session, "channels.list")
+        # A suspended or deleted channel simply isn't returned by YouTube.
+        return [{
+            "id": cid,
+            "snippet": {"title": f"Channel {cid[:8]}", "customUrl": "@x",
+                        "thumbnails": {"high": {"url": "https://x/t.jpg"}}},
+            "statistics": {"subscriberCount": "500000", "videoCount": "900",
+                           "viewCount": "1000000"},
+            "contentDetails": {"relatedPlaylists": {"uploads": "UU" + cid[2:]}},
+        } for cid in channel_ids if cid != unfetchable_channel]
+
+    monkeypatch.setattr(yt.YouTubeClient, "search", search)
+    monkeypatch.setattr(yt.YouTubeClient, "get_videos", get_videos)
+    monkeypatch.setattr(yt.YouTubeClient, "get_channels", get_channels)
+
+
+def test_search_stores_videos_from_channels_not_yet_known(client, monkeypatch):
+    """videos.channel_id is a foreign key, so the channel row must exist first.
+
+    Shipped broken: search inserted videos before fetching their channels and
+    died with 'FOREIGN KEY constraint failed' on any channel not already
+    tracked — which is most of what a search returns.
+    """
+    _stub_search(monkeypatch)
+    client.put("/api/settings", json={"youtube_api_key": "AIzaTEST"})
+
+    response = client.post("/api/discover", json={"query": "dungeons and dragons"})
+    assert response.status_code == 200
+
+    # The channel was created as a side effect of storing its videos.
+    stored = {c["id"] for c in client.get("/api/channels").json()}
+    assert "UCknown0000000000000000" in stored
+
+    detail = client.get("/api/videos/vidAAAAAAAA")
+    assert detail.status_code == 200
+    assert detail.json()["video"]["views"] == 1193730
+
+
+def test_a_video_whose_channel_cannot_be_fetched_is_skipped_not_fatal(client, monkeypatch):
+    """A deleted or suspended channel must not take the whole search down."""
+    _stub_search(monkeypatch, unfetchable_channel="UCgone000000000000000000")
+    client.put("/api/settings", json={"youtube_api_key": "AIzaTEST"})
+
+    response = client.post("/api/discover", json={"query": "anything"})
+    assert response.status_code == 200
+
+    # The good video survived; the orphan was dropped rather than crashing.
+    assert client.get("/api/videos/vidAAAAAAAA").status_code == 200
+    assert client.get("/api/videos/vidBBBBBBBB").status_code == 404
+
+
+def test_watchlist_add_works_for_an_untracked_channel(client, monkeypatch):
+    """Same foreign-key ordering bug lived in the watch-a-video path."""
+    _stub_search(monkeypatch)
+    client.put("/api/settings", json={"youtube_api_key": "AIzaTEST"})
+
+    response = client.post("/api/watchlist/videos",
+                           json={"reference": "https://youtu.be/vidAAAAAAAA"})
+    assert response.status_code == 200, response.json()
+    assert response.json()["video_id"] == "vidAAAAAAAA"

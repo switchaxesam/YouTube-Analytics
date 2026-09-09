@@ -691,12 +691,11 @@ def watch_video(payload: WatchVideo, session: Session = Depends(get_db)) -> dict
             client, session, [video_id], shorts_max_seconds=config.shorts_max_seconds
         )
         if not videos:
-            raise NotFound("YouTube returned nothing for that video — it may be private.")
+            raise NotFound(
+                "YouTube returned nothing usable for that video.",
+                "It may be private or deleted, or its channel may no longer exist.",
+            )
         video = videos[0]
-
-        raw = client.get_channels([video.channel_id])
-        if raw:
-            ingest.upsert_channel(session, raw[0])
 
         existing = session.scalar(
             select(WatchlistEntry).where(
@@ -994,14 +993,13 @@ def discover(payload: DiscoverQuery, session: Session = Depends(get_db)) -> dict
             return {"results": [], "units_spent": client.units_spent,
                     "message": "YouTube returned no videos for that search."}
 
+        # ingest_videos resolves the channels behind these results first — it
+        # has to, since a video row cannot exist without its channel row — so
+        # the denominators for the multipliers below are already stored.
         videos, _ = ingest.ingest_videos(
             client, session, video_ids, shorts_max_seconds=config.shorts_max_seconds
         )
-
-        # Fetch the channels behind the results so multipliers have a denominator.
         channel_ids = list({v.channel_id for v in videos if v.channel_id})
-        for raw in client.get_channels(channel_ids):
-            ingest.upsert_channel(session, raw)
 
         titles.analyse_and_store(session, videos)
 
