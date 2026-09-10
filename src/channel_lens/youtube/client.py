@@ -584,7 +584,7 @@ class YouTubeClient:
         self,
         uploads_playlist_id: str,
         *,
-        limit: int = 50,
+        limit: int | None = 50,
         published_after: datetime | None = None,
     ) -> list[str]:
         """Recent uploads for a channel, newest first, at 1 unit per 50.
@@ -593,15 +593,22 @@ class YouTubeClient:
         "what has this channel posted lately". The uploads playlist is ordered
         newest-first, so ``published_after`` can stop paging early instead of
         filtering after the fact.
+
+        ``limit=None`` pages the entire upload history. That is what trailing
+        baselines and breakout detection need — both walk a channel's timeline
+        and cannot do so from a truncated recent slice. It stays cheap: the
+        playlist costs 1 unit per 50 ids regardless of how far back it goes, so
+        a thousand-video channel is 20 units to enumerate.
         """
         ids: list[str] = []
         page_token: str | None = None
+        unbounded = limit is None
 
-        while len(ids) < limit:
+        while unbounded or len(ids) < limit:
             params: dict[str, Any] = {
                 "part": "contentDetails",
                 "playlistId": uploads_playlist_id,
-                "maxResults": min(MAX_BATCH, limit - len(ids)),
+                "maxResults": MAX_BATCH if unbounded else min(MAX_BATCH, limit - len(ids)),
             }
             if page_token:
                 params["pageToken"] = page_token

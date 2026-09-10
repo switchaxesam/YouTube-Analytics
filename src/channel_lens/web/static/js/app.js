@@ -11,6 +11,7 @@ import { clear, el, loading, toastError, compact, full } from './ui.js';
 const ROUTES = {
   overview:     () => import('./pages/overview.js'),
   outliers:     () => import('./pages/outliers.js'),
+  trajectory:   () => import('./pages/trajectory.js'),
   discover:     () => import('./pages/discover.js'),
   channels:     () => import('./pages/channels.js'),
   tracker:      () => import('./pages/tracker.js'),

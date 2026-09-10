@@ -138,6 +138,36 @@ class Settings:
     #: into one baseline produces nonsense multipliers.
     shorts_max_seconds: int = 180
 
+    # --- Trailing baselines ------------------------------------------------
+    #: A video is judged against the channel's uploads that preceded it, rather
+    #: than against the whole catalogue, so a channel that grew doesn't hold its
+    #: early videos to a bar that didn't exist yet.
+    #:
+    #: "count" (the preceding N uploads) or "days" (the preceding N days).
+    #: Count suits irregular uploaders; days suits a steady cadence, and is the
+    #: better choice when the upload rate itself changed.
+    trailing_window_kind: str = "count"
+    trailing_window_count: int = 15
+    trailing_window_days: int = 180
+    #: Prior uploads required before a trailing multiplier is computed at all.
+    #: Below this the video is marked "insufficient history" — a median over
+    #: three videos would otherwise be quoted with the same confidence as one
+    #: over thirty.
+    trailing_min_prior: int = 8
+
+    # --- Breakout detection ------------------------------------------------
+    #: Videos either side of a candidate breakout used to measure the channel's
+    #: level before and after it.
+    breakout_window: int = 5
+    #: Ratio of after-median to before-median at which the channel's floor is
+    #: considered to have moved permanently.
+    breakout_threshold: float = 3.0
+    #: A video that itself cleared the threshold, but whose after-median came
+    #: back within this ratio of the before-median, was a spike rather than a
+    #: step change. The distinction matters: one is a repeatable format, the
+    #: other is a lottery ticket.
+    breakout_revert_ratio: float = 1.5
+
     # --- Exclusions --------------------------------------------------------
     #: What isn't your niche. Applied across Outliers and Discover, always with
     #: a visible count of what was removed — a filter that hides results

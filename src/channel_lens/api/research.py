@@ -6,6 +6,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
+import numpy as np
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -29,9 +31,11 @@ from ..services import (
     thumbnails,
     titles,
     tracker,
+    trailing,
 )
 from ..services.ingest import estimate_channel_ingest_cost
 from ..youtube.client import (
+    chunked,
     extract_video_id,
     normalise_channel_input,
     parse_channel_references,
@@ -517,6 +521,113 @@ def _run_bulk_import(
         client.close()
 
 
+@router.post("/channels/{channel_id}/full-history", status_code=202)
+def pull_full_history(channel_id: str, session: Session = Depends(get_db)) -> dict[str, Any]:
+    """Fetch a channel's entire upload history, oldest to newest.
+
+    Trailing baselines and breakout detection both walk a channel's timeline,
+    and neither can do that from a truncated slice of recent uploads. This is
+    the mode that gets the whole thing.
+
+    Cheap: the uploads playlist is 1 unit per 50 ids and ``videos.list`` is
+    another 1 per 50, so a thousand-video channel costs about 40 units out of
+    the daily 10,000.
+    """
+    config = get_settings()
+    channel = session.get(Channel, channel_id)
+    if channel is None:
+        raise NotFound(f"No stored channel with id {channel_id}.")
+    if not config.has_data_api:
+        raise NotConfigured()
+
+    running = jobs.active("channel.full_history")
+    if running is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="A full-history pull is already running. Wait for it to finish.",
+        )
+
+    # The channel's own video count is YouTube's estimate, but it is the only
+    # forecast available and it is close enough to warn on.
+    expected = channel.video_count or 0
+    estimated_units = estimate_channel_ingest_cost(expected) if expected else 20
+
+    job = jobs.start(
+        "channel.full_history", max(1, expected),
+        lambda job, job_session: _run_full_history(job, job_session, channel_id),
+    )
+    return {
+        "job_id": job.id,
+        "channel_title": channel.title,
+        "expected_videos": expected,
+        "estimated_units": estimated_units,
+    }
+
+
+def _run_full_history(job: jobs.Job, session: Session, channel_id: str) -> dict[str, Any]:
+    """Page the whole uploads playlist, then fetch every video 50 at a time."""
+    config = get_settings()
+    channel = session.get(Channel, channel_id)
+    client = youtube_client(session, config)
+
+    db_job = JobRun(job="channel.full_history", status="running", detail=channel.title)
+    session.add(db_job)
+    session.flush()
+
+    try:
+        if not channel.uploads_playlist_id:
+            raw = client.get_channels([channel_id])
+            if raw:
+                ingest.upsert_channel(session, raw[0])
+        if not channel.uploads_playlist_id:
+            raise NotFound("This channel has no uploads playlist.")
+
+        job.current = "Listing uploads…"
+        video_ids = client.list_upload_video_ids(channel.uploads_playlist_id, limit=None)
+        job.total = max(1, len(video_ids))
+
+        stored = 0
+        # 50 at a time, committing as we go, so a long pull shows progress and
+        # a failure late on doesn't discard everything before it.
+        for batch in chunked(video_ids, 50):
+            if job.cancelled:
+                break
+            videos, _ = ingest.ingest_videos(
+                client, session, batch, shorts_max_seconds=config.shorts_max_seconds
+            )
+            stored += len(videos)
+            job.done = min(job.total, job.done + len(batch))
+            job.current = f"{stored} of {len(video_ids)} stored"
+            session.commit()
+
+        titles.analyse_and_store(
+            session,
+            list(session.scalars(select(Video).where(Video.channel_id == channel_id)).all()),
+        )
+        outliers.score_channel(
+            session, channel_id, window=config.baseline_window,
+            min_age_days=config.baseline_min_age_days,
+            min_videos=config.baseline_min_videos,
+            outlier_threshold=config.outlier_threshold,
+        )
+
+        db_job.status = "ok"
+        db_job.items_processed = stored
+        db_job.units_spent = client.units_spent
+        db_job.detail = f"Pulled {stored} of {len(video_ids)} uploads for {channel.title}."
+        db_job.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        session.flush()
+
+        return {
+            "channel_id": channel_id, "channel_title": channel.title,
+            "listed": len(video_ids), "stored": stored,
+            "units_spent": client.units_spent, "cache_hits": client.cache_hits,
+            "cancelled": job.cancelled,
+        }
+    finally:
+        client.close()
+
+
 @router.get("/jobs/live/{job_id}")
 def job_progress(job_id: str) -> dict[str, Any]:
     """Poll a background job. Cheap enough to call once a second."""
@@ -759,6 +870,150 @@ def list_outliers(
         "excluded": len(dropped),
         "exclusions": dropped[:50],
         "exclusions_active": rules.active,
+    }
+
+
+# --------------------------------------------------------------------------
+# Trailing baselines
+# --------------------------------------------------------------------------
+
+
+def _window_from(kind: str | None, count: int | None, days: int | None) -> trailing.TrailingWindow:
+    config = get_settings()
+    return trailing.TrailingWindow(
+        kind=(kind or config.trailing_window_kind),  # type: ignore[arg-type]
+        count=count or config.trailing_window_count,
+        days=days or config.trailing_window_days,
+    )
+
+
+@router.get("/trailing")
+def trailing_scores(
+    channel_id: list[str] | None = Query(None),
+    window_kind: Literal["count", "days"] | None = Query(None),
+    window_count: int | None = Query(None, ge=2, le=200),
+    window_days: int | None = Query(None, ge=7, le=3650),
+    min_prior: int | None = Query(None, ge=2, le=100),
+    fmt: Literal["all", "long", "short"] = Query("all", alias="format"),
+    sort: Literal["trailing", "catalog", "drift", "recent", "views"] = Query("trailing"),
+    direction: Literal["asc", "desc"] = Query("desc"),
+    only_sufficient: bool = Query(False),
+    limit: int = Query(200, ge=1, le=1000),
+    session: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Every video scored against what was normal for its channel at the time.
+
+    Reads stored data only, so re-running with a different window costs nothing
+    and can be done as often as you like.
+    """
+    config = get_settings()
+    window = _window_from(window_kind, window_count, window_days)
+    minimum = min_prior or config.trailing_min_prior
+
+    channels = list(session.scalars(
+        select(Channel).where(Channel.id.in_(channel_id)) if channel_id
+        else select(Channel).where(
+            (Channel.is_tracked.is_(True)) | (Channel.is_owned.is_(True))
+        )
+    ).all())
+
+    all_scores: list[trailing.TrailingScore] = []
+    summaries: list[dict[str, Any]] = []
+
+    for channel in channels:
+        videos = list(session.scalars(
+            select(Video).where(Video.channel_id == channel.id)
+        ).all())
+        if not videos:
+            continue
+
+        scores = trailing.score_channel_trailing(
+            videos, channel_title=channel.title, window=window,
+            min_prior=minimum, min_age_days=config.baseline_min_age_days,
+        )
+        trailing.detect_breakouts(
+            scores, window=config.breakout_window,
+            threshold=config.breakout_threshold,
+            revert_ratio=config.breakout_revert_ratio,
+        )
+        summaries.append(trailing.summarise_channel(
+            scores, channel_id=channel.id, channel_title=channel.title,
+            window=window.describe(),
+        ).to_dict())
+        all_scores.extend(scores)
+
+    if fmt == "long":
+        all_scores = [s for s in all_scores if not s.is_short]
+    elif fmt == "short":
+        all_scores = [s for s in all_scores if s.is_short]
+    if only_sufficient:
+        all_scores = [s for s in all_scores if s.sufficient]
+
+    keys = {
+        "trailing": lambda s: s.trailing_multiplier or -1,
+        "catalog": lambda s: s.catalog_multiplier or -1,
+        "drift": lambda s: s.drift or -1,
+        "recent": lambda s: s.published_at,
+        "views": lambda s: s.views,
+    }
+    all_scores.sort(key=keys[sort], reverse=(direction == "desc"))
+
+    return {
+        "results": [s.to_dict() for s in all_scores[:limit]],
+        "total": len(all_scores),
+        "shown": min(len(all_scores), limit),
+        "summaries": summaries,
+        "window": {
+            "kind": window.kind, "count": window.count, "days": window.days,
+            "description": window.describe(), "min_prior": minimum,
+        },
+        "breakout": {
+            "window": config.breakout_window,
+            "threshold": config.breakout_threshold,
+            "revert_ratio": config.breakout_revert_ratio,
+        },
+    }
+
+
+@router.get("/trailing/compare")
+def trailing_comparison(
+    channel_id: list[str] | None = Query(None),
+    window_kind: Literal["count", "days"] | None = Query(None),
+    window_count: int | None = Query(None, ge=2, le=200),
+    window_days: int | None = Query(None, ge=7, le=3650),
+    session: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """How much the trailing method disagrees with the catalogue one.
+
+    The point of the exercise: if the two agree, the channel was stable and
+    either method works. Where they diverge, the catalogue figure was reading
+    growth as performance.
+    """
+    body = trailing_scores(
+        channel_id=channel_id, window_kind=window_kind, window_count=window_count,
+        window_days=window_days, min_prior=None, fmt="all", sort="drift",
+        direction="desc", only_sufficient=True, limit=1000, session=session,
+    )
+
+    rows = [r for r in body["results"] if r["drift"] is not None]
+    biggest_gain = [r for r in rows if r["drift"] >= 1.5][:15]
+    biggest_drop = sorted(rows, key=lambda r: r["drift"])[:15]
+
+    return {
+        "window": body["window"],
+        "summaries": body["summaries"],
+        "compared": len(rows),
+        "median_drift": (
+            round(float(np.median([r["drift"] for r in rows])), 2) if rows else None
+        ),
+        "understated_by_catalog": biggest_gain,
+        "overstated_by_catalog": [r for r in biggest_drop if r["drift"] < 0.67],
+        "reading": (
+            "Drift above 1 means the video looks better against its own era than "
+            "against the whole catalogue — the catalogue figure was holding it to a "
+            "bar the channel only reached later. Below 1 means the opposite: the "
+            "catalogue median is inflated by a later run of bigger videos."
+        ),
     }
 
 

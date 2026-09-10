@@ -235,3 +235,15 @@ input.saved, select.saved {
   .change-effect { max-width: none; margin-left: 0; text-align: left; }
   .job-row, .change-row { flex-wrap: wrap; }
 }
+
+/* Breakout events on the Trajectory page. */
+.breakout-row {
+  display: flex; gap: 14px; align-items: flex-start;
+  padding: 11px 0; border-top: 1px solid var(--border);
+}
+.breakout-when { flex: 0 0 116px; display: flex; flex-direction: column; gap: 5px; }
+.breakout-meta { min-width: 0; flex: 1; }
+.breakout-meta .title { font-weight: 550; line-height: 1.35; }
+.breakout-meta .title:hover { color: var(--accent); }
+.breakout-row.breakout { border-left: 3px solid var(--good); padding-left: 12px; }
+.breakout-row.spike { border-left: 3px solid var(--warning); padding-left: 12px; }
