@@ -102,6 +102,39 @@ warning screen and caps at 100 users. User type must be *External*, since the
 account is personal Gmail rather than Workspace. This is spelled out in the
 in-app setup steps and the README because it is invisible until it breaks.
 
+## Trailing baselines (added 2026-09-09)
+
+`services/trailing.py` scores each video against the median of the same
+channel's uploads published *strictly before* it, in a window of either N
+uploads or N days. The whole-catalogue figure in `outliers.py` is kept beside
+it, never replaced, plus a `drift` ratio between them.
+
+Why: the catalogue median holds an old video to a bar built from years of later
+growth, and measures a recent one against a floor an earlier breakout created.
+On the real data this cut both ways — for PakPak it exposed a recent decline the
+catalogue median was masking (recent uploads at 0.05x trailing vs ~1.0x
+catalogue), not just the expected old-video correction.
+
+Rules that matter:
+
+- Below `trailing_min_prior` (default 8) prior uploads **no number is produced**
+  — the video is marked "insufficient history". A median over three videos would
+  otherwise be quoted with the same authority as one over thirty.
+- Formats never mix, so a channel with fewer than 8 long-form uploads gets no
+  long-form trailing scores at all. That is correct, and it is why Switch Axe
+  Sam's own long-form videos are currently unscorable.
+- Breakout detection collapses runs of adjacent candidates to one event: a step
+  change makes every nearby video look like a breakout because their "after"
+  windows straddle the same transition. Ties on ratio (which are the norm, not
+  the exception, around a step) break on the video's own prominence.
+- Views are current, not historical — the API exposes none. The trailing
+  population is slightly older and so has had slightly longer to accumulate,
+  biasing multipliers marginally down. Stated on every score rather than hidden.
+
+**YouTube's `videoCount` is not the uploads-playlist length.** PakPak reports 214
+videos; the playlist yields 75. Treat `videoCount` as a rough forecast for cost
+estimation only, never as a target to page toward.
+
 ## Conventions
 
 - Ingestion is idempotent: re-running updates metadata in place and adds at most
