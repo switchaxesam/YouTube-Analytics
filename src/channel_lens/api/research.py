@@ -628,6 +628,221 @@ def _run_full_history(job: jobs.Job, session: Session, channel_id: str) -> dict[
         client.close()
 
 
+class BackfillRequest(BaseModel):
+    """A full-history pull across many channels."""
+
+    #: Cap per channel, or 0 for everything the uploads playlist exposes.
+    #: A cap is worth having for channels with thousands of uploads, where the
+    #: oldest ones contribute little to a 15-upload trailing window.
+    max_per_channel: int = Field(default=0, ge=0, le=20_000)
+    #: Restrict to specific channels; empty means every tracked channel.
+    channel_ids: list[str] = []
+
+
+@router.post("/channels/full-history/estimate")
+def estimate_backfill(
+    payload: BackfillRequest, session: Session = Depends(get_db)
+) -> dict[str, Any]:
+    """Price a bulk backfill per channel and in total, spending nothing."""
+    config = get_settings()
+    channels = _backfill_targets(session, payload.channel_ids)
+
+    rows: list[dict[str, Any]] = []
+    total = 0
+    for channel in channels:
+        expected = channel.video_count or 0
+        if payload.max_per_channel:
+            expected = min(expected, payload.max_per_channel)
+        units = estimate_channel_ingest_cost(expected)
+        total += units
+        stored = session.scalar(
+            select(func.count(Video.id)).where(Video.channel_id == channel.id)) or 0
+        rows.append({
+            "channel_id": channel.id, "title": channel.title,
+            "stored": stored, "reported_total": channel.video_count or 0,
+            "will_fetch": expected, "estimated_units": units,
+        })
+
+    rows.sort(key=lambda r: r["estimated_units"], reverse=True)
+    status = ledger(config).status(session)
+    return {
+        "channels": rows,
+        "channel_count": len(rows),
+        "estimated_units": total,
+        "estimated_videos": sum(r["will_fetch"] for r in rows),
+        "remaining": status.remaining,
+        "affordable": total <= status.remaining,
+        "note": (
+            "YouTube's channel video count is only a forecast — the uploads playlist "
+            "often exposes fewer videos than it claims, so the real cost is usually "
+            "lower than this."
+        ),
+    }
+
+
+def _backfill_targets(session: Session, channel_ids: list[str]) -> list[Channel]:
+    query = (
+        select(Channel).where(Channel.id.in_(channel_ids)) if channel_ids
+        else select(Channel).where(
+            (Channel.is_tracked.is_(True)) | (Channel.is_owned.is_(True))
+        )
+    )
+    return list(session.scalars(query.order_by(Channel.title)).all())
+
+
+@router.post("/channels/full-history/all", status_code=202)
+def backfill_all_history(
+    payload: BackfillRequest, session: Session = Depends(get_db)
+) -> dict[str, Any]:
+    """Pull full upload history for every tracked channel, in the background.
+
+    The per-operation quota cap deliberately does *not* apply here. That guard
+    exists to stop a single careless click consuming the day's budget in one
+    request; this is a long-running job that prices itself up front, checks the
+    remaining budget before every channel, and stops cleanly when it runs out.
+    Refusing it against a cap meant for single requests would just push the
+    user into running it thirty times by hand.
+    """
+    config = get_settings()
+    if not config.has_data_api:
+        raise NotConfigured()
+
+    channels = _backfill_targets(session, payload.channel_ids)
+    if not channels:
+        raise HTTPException(status_code=400, detail="No tracked channels to backfill.")
+
+    running = jobs.active("channel.backfill")
+    if running is not None:
+        raise HTTPException(
+            status_code=409, detail="A backfill is already running.",
+        )
+
+    job = jobs.start(
+        "channel.backfill", len(channels),
+        lambda job, job_session: _run_backfill(
+            job, job_session, [c.id for c in channels], payload.max_per_channel,
+        ),
+    )
+    return {"job_id": job.id, "channels": len(channels)}
+
+
+def _run_backfill(
+    job: jobs.Job, session: Session, channel_ids: list[str], max_per_channel: int,
+) -> dict[str, Any]:
+    """Backfill each channel, isolated so one failure cannot end the run."""
+    config = get_settings()
+    client = youtube_client(session, config)
+    results: list[dict[str, Any]] = []
+    total_stored = 0
+    quota_ran_out = False
+
+    db_job = JobRun(job="channel.backfill", status="running",
+                    detail=f"{len(channel_ids)} channels")
+    session.add(db_job)
+    session.flush()
+
+    try:
+        for channel_id in channel_ids:
+            channel = session.get(Channel, channel_id)
+            if channel is None:
+                job.advance()
+                continue
+
+            job.current = channel.title
+            if job.cancelled or quota_ran_out:
+                results.append({"channel": channel.title, "status": "not_attempted"})
+                job.advance()
+                continue
+
+            # Enough for a page of listing plus a page of fetching.
+            if not ledger(config).can_afford(session, 4):
+                quota_ran_out = True
+                results.append({"channel": channel.title, "status": "not_attempted",
+                                "message": "daily quota exhausted"})
+                job.advance()
+                continue
+
+            units_before = client.units_spent
+            savepoint = session.begin_nested()
+            try:
+                if not channel.uploads_playlist_id:
+                    raw = client.get_channels([channel_id])
+                    if raw:
+                        ingest.upsert_channel(session, raw[0])
+                if not channel.uploads_playlist_id:
+                    raise NotFound("no uploads playlist")
+
+                ids = client.list_upload_video_ids(
+                    channel.uploads_playlist_id,
+                    limit=max_per_channel or None,
+                )
+                stored = 0
+                for batch in chunked(ids, 50):
+                    if job.cancelled or not ledger(config).can_afford(session, 2):
+                        quota_ran_out = not job.cancelled
+                        break
+                    videos, _ = ingest.ingest_videos(
+                        client, session, batch,
+                        shorts_max_seconds=config.shorts_max_seconds)
+                    stored += len(videos)
+                    job.current = f"{channel.title} — {stored} of {len(ids)}"
+
+                outliers.score_channel(
+                    session, channel_id, window=config.baseline_window,
+                    min_age_days=config.baseline_min_age_days,
+                    min_videos=config.baseline_min_videos,
+                    outlier_threshold=config.outlier_threshold,
+                )
+                savepoint.commit()
+                session.commit()
+
+                total_stored += stored
+                results.append({
+                    "channel": channel.title, "status": "ok",
+                    "listed": len(ids), "stored": stored,
+                })
+            except BaseException as exc:  # noqa: BLE001 - re-raised below if unknown
+                savepoint.rollback()
+                wasted = client.units_spent - units_before
+                if wasted:
+                    ledger(config).record_units(session, "failed_backfill", wasted)
+                if isinstance(exc, (QuotaExceeded, UpstreamQuotaExceeded)):
+                    quota_ran_out = True
+                    results.append({"channel": channel.title, "status": "not_attempted",
+                                    "message": exc.message})
+                elif isinstance(exc, YouTubeError):
+                    results.append({"channel": channel.title, "status": "failed",
+                                    "message": exc.message})
+                elif isinstance(exc, Exception):
+                    log.exception("Backfill failed for %s", channel.title)
+                    results.append({"channel": channel.title, "status": "failed",
+                                    "message": _short_error(exc)})
+                else:
+                    raise
+                session.commit()
+
+            job.advance()
+
+        ok = sum(1 for r in results if r["status"] == "ok")
+        db_job.status = "ok"
+        db_job.items_processed = total_stored
+        db_job.units_spent = client.units_spent
+        db_job.detail = (
+            f"Backfilled {ok} of {len(channel_ids)} channels, {total_stored} videos."
+        )
+        db_job.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        session.flush()
+
+        return {
+            "results": results, "channels": len(channel_ids), "succeeded": ok,
+            "videos_stored": total_stored, "units_spent": client.units_spent,
+            "cache_hits": client.cache_hits, "quota_ran_out": quota_ran_out,
+            "cancelled": job.cancelled,
+        }
+    finally:
+        client.close()
+
+
 @router.get("/jobs/live/{job_id}")
 def job_progress(job_id: str) -> dict[str, Any]:
     """Poll a background job. Cheap enough to call once a second."""
@@ -815,12 +1030,27 @@ def list_outliers(
 
     # Rebuild baselines from the full stored history per channel, not just the
     # filtered subset — filtering to "last 30 days" must not redefine normal.
+    #
+    # One query for every channel, selecting only the columns a baseline needs.
+    # The obvious per-channel loop issues N queries and materialises the whole
+    # ORM object for each row; at 60,000 videos that alone was most of the
+    # response time.
+    baseline_rows = session.execute(
+        select(
+            Video.id, Video.channel_id, Video.is_short, Video.is_live,
+            Video.latest_view_count, Video.published_at,
+        ).where(Video.channel_id.in_(channel_ids))
+    ).all()
+
+    by_channel: dict[str, list[Any]] = {}
+    for row in baseline_rows:
+        by_channel.setdefault(row.channel_id, []).append(row)
+
     baselines: dict[str, outliers.Baseline] = {}
-    for cid in channel_ids:
-        all_videos = list(session.scalars(select(Video).where(Video.channel_id == cid)).all())
+    for cid, rows in by_channel.items():
         for is_short in (False, True):
             baseline = outliers.compute_baseline(
-                all_videos, channel_id=cid, is_short=is_short,
+                rows, channel_id=cid, is_short=is_short,
                 min_age_days=config.baseline_min_age_days,
                 min_videos=config.baseline_min_videos, window=config.baseline_window,
             )

@@ -42,7 +42,11 @@ export async function render(view) {
         'very different questions — and the second one holds early videos to a bar the ' +
         'channel only reached years later.' })),
     el('div', { class: 'page-actions' },
-      el('button', { class: 'btn', onClick: () => fullHistoryDialog(load) }, 'Pull full history'))));
+      el('button', { class: 'btn', onClick: () => fullHistoryDialog(load) }, 'One channel'),
+      el('button', { class: 'btn primary', onClick: () => backfillDialog(load) },
+        'Backfill all channels'))));
+
+  view.append(backfillPanel);
 
   view.append(controls(() => load()));
   view.append(body);
@@ -340,6 +344,118 @@ function fullHistoryDialog(reload) {
         } },
     ],
   });
+}
+
+/* ------------------------------------------------- bulk backfill */
+
+const backfillPanel = el('div', { class: 'progress-slot' });
+
+/** Pull every tracked channel's full history, priced before it starts. */
+function backfillDialog(reload) {
+  const cap = el('select', {},
+    [['0', 'Everything the playlist exposes'], ['300', 'Up to 300 per channel'],
+     ['1000', 'Up to 1,000 per channel'], ['3000', 'Up to 3,000 per channel']]
+      .map(([v, l]) => el('option', { value: v, selected: v === '0', text: l })));
+
+  const estimate = el('div', { class: 'estimate' });
+
+  async function price() {
+    clear(estimate);
+    estimate.append(el('span', { class: 'muted small', text: 'Pricing…' }));
+    try {
+      const body = await api.post('/api/channels/full-history/estimate', {
+        max_per_channel: Number(cap.value),
+      });
+      clear(estimate);
+      estimate.append(
+        notice(body.affordable ? 'info' : 'warning',
+          `${full(body.channel_count)} channels · about ${full(body.estimated_units)} quota units`,
+          `Up to ${full(body.estimated_videos)} videos. You have ${full(body.remaining)} units ` +
+          `left today.` + (body.affordable ? '' :
+            ' This exceeds what is left — the run will stop cleanly when the budget is gone ' +
+            'and can be resumed after the reset.'),
+          body.note),
+        el('div', { class: 'ref-list' },
+          body.channels.slice(0, 10).map((c) => el('div', { class: 'ref-row' },
+            el('span', { class: 'ref-name truncate', text: c.title }),
+            el('span', { class: 'small muted nowrap',
+              text: `${full(c.stored)} stored → ${full(c.will_fetch)} · ${c.estimated_units}u` })))));
+    } catch (err) {
+      clear(estimate);
+      estimate.append(el('span', { class: 'muted small', text: 'Could not price that.' }));
+    }
+  }
+  cap.onchange = price;
+  price();
+
+  modal({
+    title: 'Backfill every tracked channel',
+    subtitle: 'Trailing baselines and breakout detection both improve with a longer ' +
+              'timeline. This is a one-time cost — afterwards, refreshes only fetch what ' +
+              'is new.',
+    body: el('div', { class: 'stack' },
+      el('div', { class: 'field' },
+        el('label', { text: 'How far back per channel' }), cap,
+        el('div', { class: 'help', text:
+          'A cap is worth setting for channels with thousands of uploads, where the ' +
+          'oldest videos add little to a 15-upload trailing window — though breakout ' +
+          'detection over a channel\'s whole life does benefit from everything.' })),
+      estimate),
+    actions: [
+      { label: 'Cancel' },
+      { label: 'Start backfill', variant: 'primary', onClick: async () => {
+          try {
+            const started = await api.post('/api/channels/full-history/all', {
+              max_per_channel: Number(cap.value),
+            });
+            toast(`Backfilling ${started.channels} channels. This keeps running if you ` +
+                  `switch pages.`, { kind: 'info', title: 'Started' });
+            watchBackfill(started.job_id, reload);
+          } catch (err) { toastError(err); return 'keep'; }
+        } },
+    ],
+  });
+}
+
+async function watchBackfill(jobId, reload) {
+  const tick = async () => {
+    let job;
+    try { job = await api.get(`/api/jobs/live/${jobId}`); }
+    catch { clear(backfillPanel); return; }
+
+    clear(backfillPanel);
+    if (job.running) {
+      const cancel = el('button', { class: 'btn ghost sm', text: 'Cancel' });
+      cancel.onclick = async () => {
+        cancel.disabled = true;
+        try { await api.post(`/api/jobs/live/${jobId}/cancel`); } catch { /* ignore */ }
+      };
+      backfillPanel.append(el('div', { class: 'card progress-card' },
+        el('div', { class: 'card-body' },
+          el('div', { class: 'between mb-sm' },
+            el('div', { class: 'row' }, el('div', { class: 'spinner' }),
+              el('div', {},
+                el('div', { class: 'progress-title', text: 'Backfilling channels' }),
+                el('div', { class: 'small muted truncate', text: job.current || 'Working…' }))),
+            el('div', { class: 'row' },
+              el('span', { class: 'small tnum muted', text: `${job.done} of ${job.total}` }),
+              cancel)),
+          el('div', { class: 'meter lg' },
+            el('div', { class: 'meter-fill', style: { width: `${Math.round((job.fraction || 0) * 100)}%` } })))));
+      setTimeout(tick, 1500);
+      return;
+    }
+
+    if (job.result) {
+      toast(`Stored ${full(job.result.videos_stored)} videos across ` +
+            `${job.result.succeeded} channels. ${job.result.units_spent} units spent.`,
+            { kind: 'good', title: 'Backfill finished' });
+    } else if (job.status === 'error') {
+      toast(job.error || 'The backfill failed.', { kind: 'critical' });
+    }
+    await reload();
+  };
+  setTimeout(tick, 400);
 }
 
 async function watchHistory(jobId, reload) {

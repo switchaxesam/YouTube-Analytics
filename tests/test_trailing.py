@@ -342,3 +342,93 @@ def test_drift_quantifies_the_disagreement_between_methods():
     # Trailing says "normal"; the catalogue said "underperformer". Drift > 1
     # is exactly that disagreement, and it is the number worth surfacing.
     assert early.drift > 2.0
+
+
+# ------------------------------------------------------- scale and tuning
+
+
+def test_scoring_a_large_channel_is_not_quadratic():
+    """The obvious implementation filters all prior videos for every video.
+
+    That is O(n^2) per channel: imperceptible on 50 videos and two and a half
+    minutes on 12,000, which is what shipped first.
+    """
+    import time
+
+    videos = [make(f"v{i}", views=1_000 + (i % 40) * 25, week=i * 0.3)
+              for i in range(6_000)]
+
+    start = time.time()
+    scores = trailing.score_channel_trailing(
+        videos, window=TrailingWindow(count=15), min_prior=8,
+        now=START + timedelta(weeks=3_000),
+    )
+    elapsed = time.time() - start
+
+    assert len(scores) == 6_000
+    # Generous: the quadratic version took well over a minute at this size.
+    assert elapsed < 8.0, f"took {elapsed:.1f}s — the O(n^2) path is back"
+
+
+def test_a_day_window_also_scales():
+    import time
+
+    videos = [make(f"v{i}", views=1_000, week=i * 0.3) for i in range(6_000)]
+    start = time.time()
+    trailing.score_channel_trailing(
+        videos, window=TrailingWindow(kind="days", days=180), min_prior=8,
+        now=START + timedelta(weeks=3_000),
+    )
+    assert time.time() - start < 8.0
+
+
+def test_the_breakout_window_scales_with_channel_size():
+    """One fixed window cannot serve a 30-video channel and a 12,000-video one.
+
+    Measured on real data: a fixed window of 5 reported 257 permanent floor
+    shifts for a 7,000-video channel, while a fixed 30 finds nothing at all on
+    a channel with 30 uploads.
+    """
+    assert trailing.adaptive_window(20) == trailing.MIN_BREAKOUT_WINDOW
+    assert trailing.adaptive_window(12_000) == trailing.MAX_BREAKOUT_WINDOW
+    assert (trailing.MIN_BREAKOUT_WINDOW
+            < trailing.adaptive_window(400)
+            < trailing.MAX_BREAKOUT_WINDOW)
+
+
+def test_a_noisy_high_volume_channel_does_not_produce_hundreds_of_breakouts():
+    """Ordinary volatility must not read as the channel's floor moving."""
+    import random
+
+    rng = random.Random(7)
+    # A busy channel with genuine 4x swings either way, but no lasting change.
+    videos = [
+        make(f"v{i}", views=int(10_000 * rng.uniform(0.35, 3.0)), week=i * 0.3)
+        for i in range(3_000)
+    ]
+
+    scores = trailing.score_channel_trailing(
+        videos, window=TrailingWindow(count=15), min_prior=8,
+        now=START + timedelta(weeks=2_000),
+    )
+    trailing.detect_breakouts(scores, threshold=3.0)   # adaptive window
+
+    breakouts = sum(1 for s in scores if s.breakout == "breakout")
+    assert breakouts <= 5, f"{breakouts} breakouts on a channel with no real step change"
+
+
+def test_a_real_step_change_still_survives_the_adaptive_window():
+    """Suppressing noise must not suppress the signal."""
+    videos = ([make(f"before{i}", views=1_000, week=i) for i in range(60)] +
+              [make("theone", views=80_000, week=60)] +
+              [make(f"after{i}", views=20_000, week=61 + i) for i in range(60)])
+
+    scores = trailing.score_channel_trailing(
+        videos, window=TrailingWindow(count=15), min_prior=8,
+        now=START + timedelta(weeks=200),
+    )
+    trailing.detect_breakouts(scores, threshold=3.0)
+
+    flagged = [s for s in scores if s.breakout == "breakout"]
+    assert len(flagged) == 1
+    assert flagged[0].video_id == "theone"

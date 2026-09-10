@@ -328,12 +328,17 @@ def score_videos(
     now = now or datetime.now(timezone.utc)
     scores: list[VideoScore] = []
 
-    # Percentile is computed within each channel+format group.
+    # Percentile is computed within each channel+format group. Each group is
+    # sorted once and then binary-searched, rather than rebuilt per video: the
+    # straightforward version constructs an array of every peer for every
+    # video, which is O(n²) and took ten seconds on a 12,000-video channel.
     groups: dict[str, list[float]] = {}
     for video in videos:
         key = f"{video.channel_id}:{'short' if video.is_short else 'long'}"
         if video.latest_view_count is not None:
             groups.setdefault(key, []).append(float(video.latest_view_count))
+
+    sorted_groups = {key: np.sort(np.array(values)) for key, values in groups.items()}
 
     for video in videos:
         if video.latest_view_count is None or video.published_at is None:
@@ -347,8 +352,13 @@ def score_videos(
         age = _age_days(video.published_at, now)
         multiplier = views / baseline.median_views
 
-        peers = groups.get(key) or [float(views)]
-        percentile = float((np.array(peers) <= views).mean() * 100.0)
+        peers = sorted_groups.get(key)
+        if peers is None or peers.size == 0:
+            percentile = 100.0
+        else:
+            # Count of peers at or below this video, found by binary search.
+            at_or_below = int(np.searchsorted(peers, views, side="right"))
+            percentile = at_or_below / peers.size * 100.0
 
         caveats = list(baseline.caveats)
         projected: float | None = None

@@ -34,6 +34,7 @@ order of magnitude describes neither.
 from __future__ import annotations
 
 import logging
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Literal, Sequence
@@ -157,8 +158,23 @@ def _aware(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
 
 
+def _strict_boundary(ordered: Sequence[Any], index: int, target_time: datetime) -> int:
+    """First index at or after ``index`` sharing the target's exact timestamp.
+
+    Videos published at the same instant as the target are not evidence of what
+    was normal *before* it, so they are excluded. In practice this walks back
+    zero or one positions; a channel that posts several videos in the same
+    second is the only case where it does more.
+    """
+    end = index
+    while end > 0 and _aware(ordered[end - 1].published_at) >= target_time:
+        end -= 1
+    return end
+
+
 def select_prior(
-    ordered: Sequence[Any], index: int, window: TrailingWindow
+    ordered: Sequence[Any], index: int, window: TrailingWindow,
+    times: Sequence[datetime] | None = None,
 ) -> list[Any]:
     """The comparison population for ``ordered[index]``.
 
@@ -195,12 +211,26 @@ def select_prior(
         return []
 
     target_time = _aware(ordered[index].published_at)
-    prior = [v for v in ordered[:index] if _aware(v.published_at) < target_time]
+    end = _strict_boundary(ordered, index, target_time)
+    if end <= 0:
+        return []
 
+    # Slice rather than scan. The obvious implementation filters `ordered[:index]`
+    # for every video, which is O(n) per video and therefore O(n²) per channel —
+    # imperceptible on a 50-video channel and 2.5 minutes on a 12,000-video one.
+    # The list is already sorted, so the window's start can be found directly.
     if window.kind == "days":
         cutoff = target_time - timedelta(days=window.days)
-        return [v for v in prior if _aware(v.published_at) >= cutoff]
-    return prior[-window.count:] if window.count > 0 else prior
+        if times is not None:
+            start = bisect_left(times, cutoff, 0, end)
+        else:
+            start = bisect_left(
+                [_aware(v.published_at) for v in ordered[:end]], cutoff)
+        return list(ordered[start:end])
+
+    if window.count <= 0:
+        return list(ordered[:end])
+    return list(ordered[max(0, end - window.count):end])
 
 
 def score_channel_trailing(
@@ -234,8 +264,13 @@ def score_channel_trailing(
             key=lambda v: (_aware(v.published_at), v.id),
         )
 
+        # Computed once per format, not per video: bisect needs a sorted list
+        # of comparable keys, and rebuilding it 12,000 times is the whole
+        # difference between this being instant and taking minutes.
+        times = [_aware(v.published_at) for v in ordered]
+
         for index, video in enumerate(ordered):
-            prior = select_prior(ordered, index, window)
+            prior = select_prior(ordered, index, window, times)
             views = int(video.latest_view_count)
 
             score = TrailingScore(
@@ -299,10 +334,48 @@ def score_channel_trailing(
 # --------------------------------------------------------------------------
 
 
+#: Bounds for the adaptive comparison window.
+MIN_BREAKOUT_WINDOW = 5
+MAX_BREAKOUT_WINDOW = 30
+#: One window's worth of videos per this many uploads, between those bounds.
+BREAKOUT_WINDOW_DIVISOR = 25
+
+
+def adaptive_window(video_count: int) -> int:
+    """How many videos either side of a candidate to compare.
+
+    No single number works across the range of channels involved. A median over
+    five uploads is unstable for a channel that posts daily with high variance,
+    so ordinary noise keeps clearing a 3x bar — measured on real data, a fixed
+    window of five reported **257 permanent floor shifts** for one 7,000-video
+    channel, which is meaningless. Widening it to thirty fixes that channel and
+    then finds nothing at all on a channel with thirty uploads total, because
+    thirty before and thirty after cannot both exist.
+
+    Scaling with the history available serves both: a step change on a daily
+    uploader genuinely spans more videos than one on a channel that posts
+    monthly, so the window tracking channel size is the honest behaviour rather
+    than a fudge.
+
+    >>> adaptive_window(23)          # a young channel
+    5
+    >>> adaptive_window(200)
+    8
+    >>> adaptive_window(7000)        # capped
+    30
+    >>> adaptive_window(0)
+    5
+    """
+    return max(
+        MIN_BREAKOUT_WINDOW,
+        min(MAX_BREAKOUT_WINDOW, video_count // BREAKOUT_WINDOW_DIVISOR),
+    )
+
+
 def detect_breakouts(
     scores: list[TrailingScore],
     *,
-    window: int = 5,
+    window: int = 0,
     threshold: float = 3.0,
     revert_ratio: float = 1.5,
 ) -> list[TrailingScore]:
@@ -345,10 +418,14 @@ def detect_breakouts(
         views = [float(s.views) for s in group]
         candidates: list[tuple[int, float, float]] = []
 
+        # Sized per format, since a channel's Shorts and long-form histories are
+        # usually very different lengths.
+        span = window if window > 0 else adaptive_window(len(group))
+
         for index, score in enumerate(group):
-            before = views[max(0, index - window):index]
-            after = views[index + 1:index + 1 + window]
-            if len(before) < window or len(after) < window:
+            before = views[max(0, index - span):index]
+            after = views[index + 1:index + 1 + span]
+            if len(before) < span or len(after) < span:
                 continue
 
             median_before = float(np.median(before))
@@ -372,7 +449,7 @@ def detect_breakouts(
                 # way a step change does and is marked immediately.
                 score.breakout = "spike"
 
-        for index in _sharpest_of_each_run(candidates, window):
+        for index in _sharpest_of_each_run(candidates, span):
             group[index].breakout = "breakout"
 
     return scores

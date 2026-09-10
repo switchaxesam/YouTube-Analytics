@@ -157,8 +157,11 @@ class Settings:
 
     # --- Breakout detection ------------------------------------------------
     #: Videos either side of a candidate breakout used to measure the channel's
-    #: level before and after it.
-    breakout_window: int = 5
+    #: level before and after it. 0 means scale it to the channel's history:
+    #: a fixed 5 reported 257 "permanent floor shifts" for a 7,000-video channel
+    #: because a five-video median is pure noise at that cadence, while a fixed
+    #: 30 finds nothing on a channel with 30 uploads in total.
+    breakout_window: int = 0
     #: Ratio of after-median to before-median at which the channel's floor is
     #: considered to have moved permanently.
     breakout_threshold: float = 3.0
